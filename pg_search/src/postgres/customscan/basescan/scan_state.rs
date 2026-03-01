@@ -30,7 +30,9 @@ use crate::postgres::customscan::solve_expr::SolvePostgresExpressions;
 use crate::postgres::heap::{HeapFetchState, VisibilityChecker};
 use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::utils::u64_to_item_pointer;
-use crate::postgres::{ParallelExplainData, ParallelScanArgs, ParallelScanState};
+use crate::postgres::{
+    ParallelExplainData, ParallelScanArgs, ParallelScanState, PartitionEarlyTermState,
+};
 use crate::query::SearchQueryInput;
 
 use pgrx::heap_tuple::PgHeapTuple;
@@ -41,6 +43,10 @@ use tantivy::snippet::SnippetGenerator;
 pub struct BaseScanState {
     pub parallel_state: Option<*mut ParallelScanState>,
     pub parallel_explain_data: Option<ParallelExplainData>,
+    pub early_term_state: Option<*mut PartitionEarlyTermState>,
+    pub partition_sort_rank: Option<usize>,
+    pub partition_early_term_eligible: bool,
+    pub partition_sort_desc: bool,
 
     // Note: the range table index at execution time might be different from the one at planning time,
     // so we need to use the one at execution time when creating the custom scan state.
