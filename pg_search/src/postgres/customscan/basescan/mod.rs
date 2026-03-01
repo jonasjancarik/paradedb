@@ -857,6 +857,39 @@ impl CustomScan for BaseScan {
                     }
                 }
 
+                // Mark the parallel path as eligible for cross-partition early termination
+                // when it's a sorted partition child with parallel workers.
+                let is_partition_child =
+                    (*builder.args().rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL;
+                if nworkers > 0 && is_sorted && is_partition_child {
+                    method_private.set_partition_early_term_eligible(true);
+                    // Determine sort direction for partition rank computation.
+                    // Try sort_by_pathkey first (FastFieldMixed), then TopN's orderby_info.
+                    let is_desc = if let Some(ref pathkey_style) = sort_by_pathkey {
+                        let dir = pathkey_style.direction();
+                        matches!(
+                            dir,
+                            crate::api::SortDirection::DescNullsFirst
+                                | crate::api::SortDirection::DescNullsLast
+                        )
+                    } else if let ExecMethodType::TopN {
+                        orderby_info: Some(ref info),
+                        ..
+                    } = method
+                    {
+                        info.first().is_some_and(|oi| {
+                            matches!(
+                                oi.direction,
+                                crate::api::SortDirection::DescNullsFirst
+                                    | crate::api::SortDirection::DescNullsLast
+                            )
+                        })
+                    } else {
+                        false
+                    };
+                    method_private.set_partition_sort_desc(is_desc);
+                }
+
                 custom_paths.push(path_builder.build(method_private));
             }
 
@@ -1108,6 +1141,11 @@ impl CustomScan for BaseScan {
             builder.custom_state().ambulkdelete_epoch =
                 builder.custom_private().ambulkdelete_epoch();
 
+            builder.custom_state().partition_early_term_eligible =
+                builder.custom_private().partition_early_term_eligible();
+            builder.custom_state().partition_sort_desc =
+                builder.custom_private().partition_sort_desc();
+
             assign_exec_method(&mut builder);
 
             builder.build()
@@ -1335,6 +1373,17 @@ impl CustomScan for BaseScan {
         }
 
         loop {
+            // Check cross-partition early termination: if earlier partitions have already
+            // produced enough results for the LIMIT, stop scanning this partition.
+            if let (Some(et_state), Some(rank)) = (
+                state.custom_state().early_term_state,
+                state.custom_state().partition_sort_rank,
+            ) {
+                if unsafe { (*et_state).should_terminate(rank) } {
+                    return std::ptr::null_mut();
+                }
+            }
+
             let exec_method = state.custom_state_mut().exec_method_mut();
 
             // get the next matching document from our search results and look for it in the heap
@@ -1355,6 +1404,15 @@ impl CustomScan for BaseScan {
                             // the ctid is visible
                             Some(slot) => {
                                 exec_method.increment_visible();
+
+                                // Increment cross-partition early termination counter
+                                if let (Some(et_state), Some(rank)) = (
+                                    state.custom_state().early_term_state,
+                                    state.custom_state().partition_sort_rank,
+                                ) {
+                                    (*et_state).increment_results(rank);
+                                }
+
                                 slot
                             }
 

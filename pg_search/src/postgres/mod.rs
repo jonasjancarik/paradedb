@@ -19,6 +19,7 @@ use std::alloc::Layout;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::api::HashMap;
 use crate::gucs;
@@ -389,6 +390,62 @@ const WORKER_METRICS_MAX_COUNT: usize = 256;
 /// Workers must wait until this changes before reading segment data.
 const PARALLEL_STATE_UNINITIALIZED: usize = usize::MAX;
 
+const MAX_PARTITIONS_EARLY_TERM: usize = 256;
+
+/// Shared state for cross-partition early termination in Parallel Append TopN.
+///
+/// When `ORDER BY partition_key LIMIT N` is used on a partitioned table,
+/// partitions earlier in sort order may produce enough results to satisfy the LIMIT.
+/// Later partitions can then skip scanning entirely.
+#[repr(C)]
+pub struct PartitionEarlyTermState {
+    limit: u32,
+    n_partitions: u32,
+    results_produced: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
+}
+
+impl PartitionEarlyTermState {
+    pub fn init(&mut self, limit: u32, n_partitions: u32) {
+        self.limit = limit;
+        self.n_partitions = n_partitions.min(MAX_PARTITIONS_EARLY_TERM as u32);
+        for counter in self.results_produced.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_results(&self, rank: usize) {
+        if rank < self.n_partitions as usize {
+            self.results_produced[rank].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns true if partitions with lower rank have already produced enough results
+    /// to satisfy the LIMIT, meaning this partition can stop scanning.
+    pub fn should_terminate(&self, rank: usize) -> bool {
+        if rank == 0 {
+            return false;
+        }
+        let mut sum: u32 = 0;
+        for i in 0..rank.min(self.n_partitions as usize) {
+            sum += self.results_produced[i].load(Ordering::Relaxed);
+            if sum >= self.limit {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn reset(&mut self) {
+        for counter in self.results_produced.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn size_of() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// Shared state for coordinating parallel scans across multiple workers.
 ///
 /// # Concurrency Model
@@ -430,6 +487,8 @@ pub struct ParallelScanState {
     /// Protected by mutex.
     nsegments: usize,
     queries_per_worker: [u16; WORKER_METRICS_MAX_COUNT],
+    /// Offset from DSM segment base to PartitionEarlyTermState; 0 = not applicable.
+    early_term_offset: usize,
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
 }
 
@@ -447,6 +506,7 @@ impl ParallelScanState {
         self.mutex.init();
         self.aggregation_cv.init();
         self.init_cv.init();
+        self.early_term_offset = 0;
         self.populate(args.segment_readers, &args.query, args.with_aggregates);
     }
 
@@ -472,6 +532,7 @@ impl ParallelScanState {
     pub fn create(&mut self) {
         self.mutex.init();
         self.init_cv.init();
+        self.early_term_offset = 0;
         // Mark as uninitialized so workers know to wait for the leader
         self.mark_uninitialized();
     }

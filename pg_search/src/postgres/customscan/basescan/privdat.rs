@@ -56,6 +56,11 @@ pub struct PrivateData {
     // Whether this path was chosen as a sorted path (declares pathkeys for index's sort_by field).
     // When true, the execution should use the sorted merge path for segment scanning.
     use_sorted_path: bool,
+    // Whether this parallel path is eligible for cross-partition early termination.
+    // Set at plan time for sorted TopN on partition children with nworkers > 0.
+    partition_early_term_eligible: bool,
+    // Whether the partition sort order is descending (for early termination rank computation).
+    partition_sort_desc: bool,
 }
 
 mod var_attname_lookup_serializer {
@@ -233,6 +238,14 @@ impl PrivateData {
     pub fn set_use_sorted_path(&mut self, use_sorted: bool) {
         self.use_sorted_path = use_sorted;
     }
+
+    pub fn set_partition_early_term_eligible(&mut self, eligible: bool) {
+        self.partition_early_term_eligible = eligible;
+    }
+
+    pub fn set_partition_sort_desc(&mut self, is_desc: bool) {
+        self.partition_sort_desc = is_desc;
+    }
 }
 
 //
@@ -307,5 +320,13 @@ impl PrivateData {
 
     pub fn use_sorted_path(&self) -> bool {
         self.use_sorted_path
+    }
+
+    pub fn partition_early_term_eligible(&self) -> bool {
+        self.partition_early_term_eligible
+    }
+
+    pub fn partition_sort_desc(&self) -> bool {
+        self.partition_sort_desc
     }
 }

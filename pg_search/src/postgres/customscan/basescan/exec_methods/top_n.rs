@@ -311,6 +311,14 @@ impl ExecMethod for TopNScanExecState {
             return false;
         }
 
+        // Check cross-partition early termination: if earlier partitions have already
+        // produced enough results for the LIMIT, skip the expensive Tantivy query.
+        if let (Some(et_state), Some(rank)) = (state.early_term_state, state.partition_sort_rank) {
+            if unsafe { (*et_state).should_terminate(rank) } {
+                return false;
+            }
+        }
+
         // We track the total number of queries executed by Top-N (for any of the above reasons).
         state.increment_query_count();
 
