@@ -56,8 +56,8 @@ use crate::postgres::customscan::builders::custom_state::{
 };
 use crate::postgres::customscan::explainer::Explainer;
 use crate::postgres::customscan::orderby::{
-    analyze_sort_expression, extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey,
-    PathKeyInfo, SortExpressionType, UnusableReason,
+    extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey, PathKeyInfo,
+    UnusableReason,
 };
 use crate::postgres::customscan::parallel::{compute_nworkers, list_segment_ids, RowEstimate};
 use crate::postgres::customscan::projections::{
@@ -77,7 +77,6 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::rel_get_bm25_index;
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::utils::filter_implied_predicates;
-use crate::postgres::var::VarContext;
 use crate::query::pdb_query::pdb;
 use crate::query::SearchQueryInput;
 use crate::schema::SearchIndexSchema;
@@ -435,30 +434,27 @@ unsafe fn maybe_limit_from_parse(root: *mut pg_sys::PlannerInfo) -> Option<f64> 
     }
 }
 
-unsafe fn is_varno_valid_for_relation(
-    root: *mut pg_sys::PlannerInfo,
-    varno: pg_sys::Index,
-    current_rti: pg_sys::Index,
-) -> bool {
-    if varno == current_rti {
+unsafe fn is_raw_orderby_target_expr(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+
+    if nodecast!(Var, T_Var, node).is_some() {
         return true;
     }
 
-    if !(*root).append_rel_list.is_null() {
-        let append_rels = PgList::<pg_sys::AppendRelInfo>::from_pg((*root).append_rel_list);
-        for appinfo in append_rels.iter_ptr() {
-            if (*appinfo).parent_relid == varno && (*appinfo).child_relid == current_rti {
-                return true;
-            }
-        }
+    if let Some(relabel) = nodecast!(RelabelType, T_RelabelType, node) {
+        return is_raw_orderby_target_expr((*relabel).arg.cast());
+    }
+
+    if let Some(phv) = nodecast!(PlaceHolderVar, T_PlaceHolderVar, node) {
+        return is_raw_orderby_target_expr((*phv).phexpr.cast());
     }
 
     false
 }
 
 unsafe fn first_raw_orderby_field_and_direction(
-    root: *mut pg_sys::PlannerInfo,
-    rti: pg_sys::Index,
     pathkeys: Option<&Vec<OrderByStyle>>,
 ) -> Option<(String, bool)> {
     let first_pathkey_style = pathkeys?.first()?;
@@ -472,26 +468,7 @@ unsafe fn first_raw_orderby_field_and_direction(
 
     let mut found_matching_raw_column = false;
     for member in members.iter_ptr() {
-        let expr = (*member).em_expr;
-        let Some((sort_type, var, field_name_opt)) =
-            analyze_sort_expression(expr.cast(), VarContext::from_planner(root))
-        else {
-            continue;
-        };
-
-        if sort_type != SortExpressionType::Raw {
-            continue;
-        }
-
-        if !is_varno_valid_for_relation(root, (*var).varno as pg_sys::Index, rti) {
-            continue;
-        }
-
-        let Some(field_name) = field_name_opt else {
-            continue;
-        };
-
-        if field_name.root() == expected_field {
+        if is_raw_orderby_target_expr((*member).em_expr.cast()) {
             found_matching_raw_column = true;
             break;
         }
@@ -528,7 +505,7 @@ unsafe fn partition_parent_oid(child_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
 
 unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<String> {
     Spi::get_one_with_args::<String>(
-        "SELECT a.attname
+        "SELECT a.attname::text
          FROM pg_partitioned_table p
          JOIN LATERAL unnest(p.partattrs::smallint[]) WITH ORDINALITY AS k(attnum, ord)
            ON ord = 1
@@ -547,12 +524,10 @@ unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) ->
 }
 
 unsafe fn partition_early_term_sort_desc_if_safe(
-    root: *mut pg_sys::PlannerInfo,
-    rti: pg_sys::Index,
     child_oid: pg_sys::Oid,
     pathkeys: Option<&Vec<OrderByStyle>>,
 ) -> Option<bool> {
-    let (orderby_col, is_desc) = first_raw_orderby_field_and_direction(root, rti, pathkeys)?;
+    let (orderby_col, is_desc) = first_raw_orderby_field_and_direction(pathkeys)?;
     let parent_oid = partition_parent_oid(child_oid)?;
     let partition_col = range_partition_key_column_without_default(parent_oid)?;
 
@@ -891,39 +866,15 @@ impl CustomScan for BaseScan {
 
             let is_partition_child = partition_parent_oid(table.oid()).is_some();
             let partition_early_term_sort_desc = if is_partition_child {
-                partition_early_term_sort_desc_if_safe(
-                    builder.args().root,
-                    rti,
-                    table.oid(),
-                    topn_pathkey_info.pathkeys(),
-                )
+                partition_early_term_sort_desc_if_safe(table.oid(), topn_pathkey_info.pathkeys())
             } else {
                 None
             };
-            let partition_sorted_topn_is_safe = partition_early_term_sort_desc.is_some();
 
             // For each execution method variant (e.g. sorted vs unsorted), we build a separate
             // CustomPath. This allows the Postgres planner to choose the most efficient
             // implementation based on costs and downstream requirements like ordering.
             for method in exec_method_types {
-                // Partition-child TopN ORDER BY paths are only safe when partition ordering is
-                // proven to align with ORDER BY. If not, we fall back to Normal scan so PostgreSQL
-                // performs the full global sort/limit semantics.
-                let method = if is_partition_child
-                    && matches!(
-                        method,
-                        ExecMethodType::TopN {
-                            orderby_info: Some(..),
-                            ..
-                        }
-                    )
-                    && !partition_sorted_topn_is_safe
-                {
-                    ExecMethodType::Normal
-                } else {
-                    method
-                };
-
                 let per_tuple_cost = match &method {
                     // returning fields from fast fields
                     ExecMethodType::FastFieldMixed { .. } => pg_sys::cpu_index_tuple_cost,
