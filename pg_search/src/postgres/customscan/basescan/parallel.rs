@@ -17,66 +17,18 @@
 
 use std::os::raw::c_void;
 
-use crate::api::SortDirection;
 use crate::parallel_worker::{estimate_chunk, estimate_keys};
 use crate::postgres::customscan::basescan::BaseScan;
 use crate::postgres::customscan::builders::custom_state::CustomScanStateWrapper;
 use crate::postgres::customscan::dsm::ParallelQueryCapable;
-use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::{ParallelScanState, PartitionEarlyTermState};
 
 use pgrx::pg_sys::{self, shm_toc, ParallelContext, Size};
-
-extern "C" {
-    fn get_partition_parent(partition_oid: pg_sys::Oid, even_if_detached: bool) -> pg_sys::Oid;
-}
 
 /// shm_toc key for the shared PartitionEarlyTermState.
 /// Chosen to avoid collisions with PostgreSQL internal keys (0xE0...) and
 /// our parallel_worker keys (1..3).
 const EARLY_TERM_TOC_KEY: u64 = 0xB250_0000_0000_0001;
-
-/// Compute the sort rank of a partition child within its parent's partition list.
-/// For ascending sorts, rank 0 = lowest-valued partition (first in oids list).
-/// For descending sorts, rank 0 = highest-valued partition (last in oids list).
-unsafe fn compute_partition_rank(
-    child_oid: pg_sys::Oid,
-    sort_direction: SortDirection,
-) -> Option<usize> {
-    let parent_oid = get_partition_parent(child_oid, false);
-    if parent_oid == pg_sys::InvalidOid {
-        return None;
-    }
-    let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
-    let pdesc = pg_sys::RelationGetPartitionDesc(parent_rel.as_ptr(), true);
-    if pdesc.is_null() {
-        return None;
-    }
-    let nparts = (*pdesc).nparts as usize;
-    let oids = std::slice::from_raw_parts((*pdesc).oids, nparts);
-    let asc_rank = oids.iter().position(|&oid| oid == child_oid);
-    let is_desc = matches!(
-        sort_direction,
-        SortDirection::DescNullsFirst | SortDirection::DescNullsLast
-    );
-
-    asc_rank.map(|rank| if is_desc { nparts - 1 - rank } else { rank })
-}
-
-/// Get the number of partitions for a parent relation given a child OID.
-unsafe fn get_n_partitions(child_oid: pg_sys::Oid) -> u32 {
-    let parent_oid = get_partition_parent(child_oid, false);
-    if parent_oid == pg_sys::InvalidOid {
-        return 0;
-    }
-    let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
-    let pdesc = pg_sys::RelationGetPartitionDesc(parent_rel.as_ptr(), true);
-    if pdesc.is_null() {
-        0
-    } else {
-        (*pdesc).nparts as u32
-    }
-}
 
 impl ParallelQueryCapable for BaseScan {
     fn estimate_dsm_custom_scan(
@@ -131,8 +83,7 @@ impl ParallelQueryCapable for BaseScan {
                     let et_ptr = pg_sys::shm_toc_allocate(toc, PartitionEarlyTermState::size_of())
                         as *mut PartitionEarlyTermState;
 
-                    let child_oid = state.custom_state().heaprelid;
-                    let n_partitions = get_n_partitions(child_oid);
+                    let n_partitions = state.custom_state().heaprel().get_n_partitions();
                     let limit = state.custom_state().limit().unwrap_or(0) as u32;
                     (*et_ptr).init(limit, n_partitions);
 
@@ -145,10 +96,11 @@ impl ParallelQueryCapable for BaseScan {
                         Some(existing as *mut PartitionEarlyTermState);
                 }
 
-                let child_oid = state.custom_state().heaprelid;
                 let sort_direction = state.custom_state().partition_sort_direction;
-                state.custom_state_mut().partition_sort_rank =
-                    compute_partition_rank(child_oid, sort_direction);
+                state.custom_state_mut().partition_sort_rank = state
+                    .custom_state()
+                    .heaprel()
+                    .compute_partition_rank(sort_direction);
             }
         }
     }
@@ -193,10 +145,11 @@ impl ParallelQueryCapable for BaseScan {
                 state.custom_state_mut().early_term_state =
                     Some(et_ptr as *mut PartitionEarlyTermState);
 
-                let child_oid = state.custom_state().heaprelid;
                 let sort_direction = state.custom_state().partition_sort_direction;
-                state.custom_state_mut().partition_sort_rank =
-                    compute_partition_rank(child_oid, sort_direction);
+                state.custom_state_mut().partition_sort_rank = state
+                    .custom_state()
+                    .heaprel()
+                    .compute_partition_rank(sort_direction);
             }
         }
     }
