@@ -29,7 +29,7 @@ use std::sync::Once;
 
 use crate::api::operator::{anyelement_query_input_opoid, estimate_selectivity};
 use crate::api::window_aggregate::window_agg_oid;
-use crate::api::{HashMap, HashSet, OrderByFeature, OrderByInfo, Varno};
+use crate::api::{HashMap, HashSet, OrderByFeature, OrderByInfo, SortDirection, Varno};
 use crate::gucs;
 use crate::index::fast_fields_helper::WhichFastField;
 use crate::index::mvcc::MvccSatisfies;
@@ -48,7 +48,7 @@ use crate::postgres::customscan::basescan::projections::window_agg::{
 };
 use crate::postgres::customscan::basescan::scan_state::BaseScanState;
 use crate::postgres::customscan::builders::custom_path::{
-    restrict_info, CustomPathBuilder, ExecMethodType, Flags, RestrictInfoType,
+    restrict_info, CustomPathBuilder, ExecMethodType, Flags, OrderByStyle, RestrictInfoType,
 };
 use crate::postgres::customscan::builders::custom_scan::CustomScanBuilder;
 use crate::postgres::customscan::builders::custom_state::{
@@ -56,8 +56,8 @@ use crate::postgres::customscan::builders::custom_state::{
 };
 use crate::postgres::customscan::explainer::Explainer;
 use crate::postgres::customscan::orderby::{
-    extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey, PathKeyInfo,
-    UnusableReason,
+    analyze_sort_expression, extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey,
+    PathKeyInfo, SortExpressionType, UnusableReason,
 };
 use crate::postgres::customscan::parallel::{compute_nworkers, list_segment_ids, RowEstimate};
 use crate::postgres::customscan::projections::{
@@ -77,13 +77,14 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::rel_get_bm25_index;
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::utils::filter_implied_predicates;
+use crate::postgres::var::VarContext;
 use crate::query::pdb_query::pdb;
 use crate::query::SearchQueryInput;
 use crate::schema::SearchIndexSchema;
 use crate::{nodecast, DEFAULT_STARTUP_COST, PARAMETERIZED_SELECTIVITY, UNKNOWN_SELECTIVITY};
 use crate::{FULL_RELATION_SELECTIVITY, UNASSIGNED_SELECTIVITY};
 
-use pgrx::{direct_function_call, pg_sys, FromDatum, IntoDatum, PgList, PgMemoryContexts};
+use pgrx::{direct_function_call, pg_sys, FromDatum, IntoDatum, PgList, PgMemoryContexts, Spi};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::Index;
 
@@ -434,6 +435,134 @@ unsafe fn maybe_limit_from_parse(root: *mut pg_sys::PlannerInfo) -> Option<f64> 
     }
 }
 
+unsafe fn is_varno_valid_for_relation(
+    root: *mut pg_sys::PlannerInfo,
+    varno: pg_sys::Index,
+    current_rti: pg_sys::Index,
+) -> bool {
+    if varno == current_rti {
+        return true;
+    }
+
+    if !(*root).append_rel_list.is_null() {
+        let append_rels = PgList::<pg_sys::AppendRelInfo>::from_pg((*root).append_rel_list);
+        for appinfo in append_rels.iter_ptr() {
+            if (*appinfo).parent_relid == varno && (*appinfo).child_relid == current_rti {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+unsafe fn first_raw_orderby_field_and_direction(
+    root: *mut pg_sys::PlannerInfo,
+    rti: pg_sys::Index,
+    pathkeys: Option<&Vec<OrderByStyle>>,
+) -> Option<(String, bool)> {
+    let first_pathkey_style = pathkeys?.first()?;
+    let (pathkey, expected_field) = match first_pathkey_style {
+        OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.root()),
+        OrderByStyle::Score(_) => return None,
+    };
+
+    let equivclass = (*pathkey).pk_eclass;
+    let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+
+    let mut found_matching_raw_column = false;
+    for member in members.iter_ptr() {
+        let expr = (*member).em_expr;
+        let Some((sort_type, var, field_name_opt)) =
+            analyze_sort_expression(expr.cast(), VarContext::from_planner(root))
+        else {
+            continue;
+        };
+
+        if sort_type != SortExpressionType::Raw {
+            continue;
+        }
+
+        if !is_varno_valid_for_relation(root, (*var).varno as pg_sys::Index, rti) {
+            continue;
+        }
+
+        let Some(field_name) = field_name_opt else {
+            continue;
+        };
+
+        if field_name.root() == expected_field {
+            found_matching_raw_column = true;
+            break;
+        }
+    }
+
+    if !found_matching_raw_column {
+        return None;
+    }
+
+    let is_desc = matches!(
+        first_pathkey_style.direction(),
+        SortDirection::DescNullsFirst | SortDirection::DescNullsLast
+    );
+    Some((expected_field, is_desc))
+}
+
+unsafe fn partition_parent_oid(child_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    let parent_oid = Spi::get_one_with_args::<pg_sys::Oid>(
+        "SELECT inhparent
+         FROM pg_inherits
+         WHERE inhrelid = $1
+         LIMIT 1",
+        &[child_oid.into()],
+    )
+    .ok()
+    .flatten()?;
+
+    if parent_oid == pg_sys::InvalidOid {
+        None
+    } else {
+        Some(parent_oid)
+    }
+}
+
+unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<String> {
+    Spi::get_one_with_args::<String>(
+        "SELECT a.attname
+         FROM pg_partitioned_table p
+         JOIN LATERAL unnest(p.partattrs::smallint[]) WITH ORDINALITY AS k(attnum, ord)
+           ON ord = 1
+         JOIN pg_attribute a
+           ON a.attrelid = p.partrelid
+          AND a.attnum = k.attnum
+         WHERE p.partrelid = $1
+           AND p.partstrat = 'r'
+           AND p.partnatts = 1
+           AND p.partdefid = '0'::oid
+           AND p.partexprs IS NULL",
+        &[parent_oid.into()],
+    )
+    .ok()
+    .flatten()
+}
+
+unsafe fn partition_early_term_sort_desc_if_safe(
+    root: *mut pg_sys::PlannerInfo,
+    rti: pg_sys::Index,
+    child_oid: pg_sys::Oid,
+    pathkeys: Option<&Vec<OrderByStyle>>,
+) -> Option<bool> {
+    let (orderby_col, is_desc) = first_raw_orderby_field_and_direction(root, rti, pathkeys)?;
+    let parent_oid = partition_parent_oid(child_oid)?;
+    let partition_col = range_partition_key_column_without_default(parent_oid)?;
+
+    if orderby_col == partition_col {
+        Some(is_desc)
+    } else {
+        None
+    }
+}
+
 impl CustomScan for BaseScan {
     const NAME: &'static CStr = c"ParadeDB Scan";
 
@@ -760,10 +889,41 @@ impl CustomScan for BaseScan {
             let startup_cost = DEFAULT_STARTUP_COST;
             let mut custom_paths = Vec::new();
 
+            let is_partition_child = partition_parent_oid(table.oid()).is_some();
+            let partition_early_term_sort_desc = if is_partition_child {
+                partition_early_term_sort_desc_if_safe(
+                    builder.args().root,
+                    rti,
+                    table.oid(),
+                    topn_pathkey_info.pathkeys(),
+                )
+            } else {
+                None
+            };
+            let partition_sorted_topn_is_safe = partition_early_term_sort_desc.is_some();
+
             // For each execution method variant (e.g. sorted vs unsorted), we build a separate
             // CustomPath. This allows the Postgres planner to choose the most efficient
             // implementation based on costs and downstream requirements like ordering.
             for method in exec_method_types {
+                // Partition-child TopN ORDER BY paths are only safe when partition ordering is
+                // proven to align with ORDER BY. If not, we fall back to Normal scan so PostgreSQL
+                // performs the full global sort/limit semantics.
+                let method = if is_partition_child
+                    && matches!(
+                        method,
+                        ExecMethodType::TopN {
+                            orderby_info: Some(..),
+                            ..
+                        }
+                    )
+                    && !partition_sorted_topn_is_safe
+                {
+                    ExecMethodType::Normal
+                } else {
+                    method
+                };
+
                 let per_tuple_cost = match &method {
                     // returning fields from fast fields
                     ExecMethodType::FastFieldMixed { .. } => pg_sys::cpu_index_tuple_cost,
@@ -857,37 +1017,22 @@ impl CustomScan for BaseScan {
                     }
                 }
 
-                // Mark the parallel path as eligible for cross-partition early termination
-                // when it's a sorted partition child with parallel workers.
-                let is_partition_child =
-                    (*builder.args().rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL;
-                if nworkers > 0 && is_sorted && is_partition_child {
-                    method_private.set_partition_early_term_eligible(true);
-                    // Determine sort direction for partition rank computation.
-                    // Try sort_by_pathkey first (FastFieldMixed), then TopN's orderby_info.
-                    let is_desc = if let Some(ref pathkey_style) = sort_by_pathkey {
-                        let dir = pathkey_style.direction();
-                        matches!(
-                            dir,
-                            crate::api::SortDirection::DescNullsFirst
-                                | crate::api::SortDirection::DescNullsLast
-                        )
-                    } else if let ExecMethodType::TopN {
-                        orderby_info: Some(ref info),
-                        ..
-                    } = method
-                    {
-                        info.first().is_some_and(|oi| {
-                            matches!(
-                                oi.direction,
-                                crate::api::SortDirection::DescNullsFirst
-                                    | crate::api::SortDirection::DescNullsLast
-                            )
-                        })
-                    } else {
-                        false
-                    };
-                    method_private.set_partition_sort_desc(is_desc);
+                // Mark the parallel path as eligible for cross-partition early termination only
+                // when this is a TopN path and partition order can be proven to match ORDER BY.
+                if nworkers > 0
+                    && is_partition_child
+                    && matches!(
+                        method,
+                        ExecMethodType::TopN {
+                            orderby_info: Some(..),
+                            ..
+                        }
+                    )
+                {
+                    if let Some(is_desc) = partition_early_term_sort_desc {
+                        method_private.set_partition_early_term_eligible(true);
+                        method_private.set_partition_sort_desc(is_desc);
+                    }
                 }
 
                 custom_paths.push(path_builder.build(method_private));
