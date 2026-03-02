@@ -92,7 +92,6 @@ use tantivy::Index;
 pub struct BaseScan;
 
 extern "C" {
-    fn get_partition_parent(partition_oid: pg_sys::Oid, even_if_detached: bool) -> pg_sys::Oid;
     fn get_default_partition_oid(parent_oid: pg_sys::Oid) -> pg_sys::Oid;
     #[link_name = "RelationGetPartitionKey"]
     fn relation_get_partition_key(rel: pg_sys::Relation) -> pg_sys::PartitionKey;
@@ -456,6 +455,42 @@ struct PartitionOrderingKey {
     direction: SortDirection,
 }
 
+unsafe fn partition_parent_oid_from_append_rel(
+    root: *mut pg_sys::PlannerInfo,
+    child_rti: pg_sys::Index,
+) -> Option<pg_sys::Oid> {
+    if root.is_null() || (*root).append_rel_list.is_null() || (*root).parse.is_null() {
+        return None;
+    }
+
+    let append_rels = PgList::<pg_sys::AppendRelInfo>::from_pg((*root).append_rel_list);
+    let mut parent_rti = None;
+    for appinfo in append_rels.iter_ptr() {
+        if (*appinfo).child_relid == child_rti {
+            parent_rti = Some((*appinfo).parent_relid);
+            break;
+        }
+    }
+    let parent_rti = parent_rti?;
+
+    if parent_rti == 0 {
+        return None;
+    }
+
+    let rtable = PgList::<pg_sys::RangeTblEntry>::from_pg((*(*root).parse).rtable);
+    let parent_rte = rtable.get_ptr((parent_rti as usize).checked_sub(1)?)?;
+    if (*parent_rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+        return None;
+    }
+
+    let parent_oid = (*parent_rte).relid;
+    if parent_oid == pg_sys::InvalidOid {
+        None
+    } else {
+        Some(parent_oid)
+    }
+}
+
 impl PartitionOrderingKey {
     unsafe fn first_raw_from_pathkeys(
         root: *mut pg_sys::PlannerInfo,
@@ -495,14 +530,15 @@ impl PartitionOrderingKey {
 
     unsafe fn try_new(
         root: *mut pg_sys::PlannerInfo,
-        child_oid: pg_sys::Oid,
+        child_rti: pg_sys::Index,
+        child_rel: &PgSearchRelation,
         pathkeys: Option<&Vec<OrderByStyle>>,
     ) -> Option<Self> {
         let ordering_key = Self::first_raw_from_pathkeys(root, pathkeys)?;
-        let parent_oid = get_partition_parent(child_oid, false);
-        if parent_oid == pg_sys::InvalidOid {
+        if !(*child_rel.rd_rel).relispartition {
             return None;
         }
+        let parent_oid = partition_parent_oid_from_append_rel(root, child_rti)?;
 
         let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
 
@@ -878,7 +914,7 @@ impl CustomScan for BaseScan {
             let mut custom_paths = Vec::new();
 
             let partition_ordering_key =
-                PartitionOrderingKey::try_new(root, table.oid(), topn_pathkey_info.pathkeys());
+                PartitionOrderingKey::try_new(root, rti, &table, topn_pathkey_info.pathkeys());
 
             // For each execution method variant (e.g. sorted vs unsorted), we build a separate
             // CustomPath. This allows the Postgres planner to choose the most efficient
@@ -1357,6 +1393,10 @@ impl CustomScan for BaseScan {
                     state.custom_state().total_query_count().try_into().unwrap(),
                     None,
                 );
+                explainer.add_bool(
+                    "   Terminated Early",
+                    state.custom_state().terminated_early(),
+                );
             }
         }
 
@@ -1486,6 +1526,7 @@ impl CustomScan for BaseScan {
                 state.custom_state().partition_sort_rank,
             ) {
                 if unsafe { (*et_state).should_terminate(rank) } {
+                    state.custom_state_mut().mark_terminated_early();
                     return std::ptr::null_mut();
                 }
             }

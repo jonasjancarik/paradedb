@@ -315,6 +315,7 @@ impl ExecMethod for TopNScanExecState {
         // produced enough results for the LIMIT, skip the expensive Tantivy query.
         if let (Some(et_state), Some(rank)) = (state.early_term_state, state.partition_sort_rank) {
             if unsafe { (*et_state).should_terminate(rank) } {
+                state.mark_terminated_early();
                 return false;
             }
         }

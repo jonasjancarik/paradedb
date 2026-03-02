@@ -487,6 +487,7 @@ pub struct ParallelScanState {
     /// Protected by mutex.
     nsegments: usize,
     queries_per_worker: [u16; WORKER_METRICS_MAX_COUNT],
+    terminated_early_per_worker: [bool; WORKER_METRICS_MAX_COUNT],
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
 }
 
@@ -515,6 +516,7 @@ impl ParallelScanState {
     fn populate(&mut self, segments: &[SegmentReader], query: &[u8], with_aggregates: bool) {
         self.payload.init(segments, query, with_aggregates);
         self.queries_per_worker = [0; WORKER_METRICS_MAX_COUNT];
+        self.terminated_early_per_worker = [false; WORKER_METRICS_MAX_COUNT];
         self.remaining_segments = segments.len();
         // Set nsegments LAST - this signals initialization is complete
         self.nsegments = segments.len();
@@ -555,12 +557,27 @@ impl ParallelScanState {
         self.queries_per_worker.get_mut(offset)
     }
 
+    fn worker_terminated_early(&mut self, parallel_worker_number: i32) -> Option<&mut bool> {
+        let offset: usize = (parallel_worker_number + 1).try_into().unwrap();
+        // We will not record metrics past WORKER_METRICS_MAX_COUNT workers.
+        self.terminated_early_per_worker.get_mut(offset)
+    }
+
     /// Increment the count of queries executed by this worker.
     pub fn increment_query_count(&mut self) {
         let _mutex = self.acquire_mutex();
         let parallel_worker_number = unsafe { pg_sys::ParallelWorkerNumber };
         if let Some(query_count) = self.query_count(parallel_worker_number) {
             *query_count = query_count.saturating_add(1);
+        }
+    }
+
+    /// Mark that this worker observed cross-partition early termination.
+    pub fn mark_terminated_early(&mut self) {
+        let _mutex = self.acquire_mutex();
+        let parallel_worker_number = unsafe { pg_sys::ParallelWorkerNumber };
+        if let Some(terminated_early) = self.worker_terminated_early(parallel_worker_number) {
+            *terminated_early = true;
         }
     }
 
@@ -810,17 +827,34 @@ impl ParallelScanState {
                     id: self.segment_id(i).short_uuid_string(),
                     deleted_docs: self.num_deleted_docs(i),
                     max_doc: self.segment_max_docs(i),
+                    terminated_early: false,
                 });
         }
         let mut total_query_count: usize = 0;
+        let mut terminated_early = false;
         for (parallel_worker_number, worker) in workers.iter_mut() {
             let query_count = self.query_count(*parallel_worker_number).copied();
             total_query_count += query_count.map(|qc| qc as usize).unwrap_or(0);
             worker.query_count = query_count;
+
+            let worker_terminated_early = self
+                .worker_terminated_early(*parallel_worker_number)
+                .copied()
+                .unwrap_or(false);
+            terminated_early |= worker_terminated_early;
+            for segment in &mut worker.claimed_segments {
+                segment.terminated_early = worker_terminated_early;
+            }
         }
 
         ParallelExplainData {
             total_query_count,
+            terminated_early: terminated_early
+                || self
+                    .terminated_early_per_worker
+                    .iter()
+                    .copied()
+                    .any(|value| value),
             workers,
         }
     }
@@ -859,6 +893,7 @@ extern "C" {
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 pub struct ParallelExplainData {
     total_query_count: usize,
+    terminated_early: bool,
     workers: BTreeMap<i32, ParallelExplainWorkerData>,
 }
 
@@ -873,4 +908,5 @@ pub struct ClaimedSegmentData {
     id: String,
     deleted_docs: u32,
     max_doc: u32,
+    terminated_early: bool,
 }

@@ -63,6 +63,7 @@ pub struct BaseScanState {
     pub targetlist_len: usize,
 
     query_count: usize,
+    terminated_early: bool,
     pub virtual_tuple_count: usize,
 
     pub heaprelid: pg_sys::Oid,
@@ -343,11 +344,28 @@ impl BaseScanState {
         }
     }
 
+    pub fn terminated_early(&self) -> bool {
+        if let Some(explain_data) = &self.parallel_explain_data {
+            explain_data.terminated_early
+        } else {
+            self.terminated_early
+        }
+    }
+
     pub fn increment_query_count(&mut self) {
         self.query_count += 1;
         if let Some(parallel_state) = self.parallel_state {
             unsafe {
                 (*parallel_state).increment_query_count();
+            }
+        }
+    }
+
+    pub fn mark_terminated_early(&mut self) {
+        self.terminated_early = true;
+        if let Some(parallel_state) = self.parallel_state {
+            unsafe {
+                (*parallel_state).mark_terminated_early();
             }
         }
     }
@@ -363,6 +381,7 @@ impl BaseScanState {
             }
         }
         self.query_count = 0;
+        self.terminated_early = false;
         self.virtual_tuple_count = 0;
         if let Some(vc) = &mut self.visibility_checker {
             vc.heap_tuple_check_count = 0;
