@@ -450,37 +450,71 @@ unsafe fn maybe_limit_from_parse(root: *mut pg_sys::PlannerInfo) -> Option<f64> 
     }
 }
 
-unsafe fn first_raw_orderby_field_and_direction(
-    root: *mut pg_sys::PlannerInfo,
-    pathkeys: Option<&Vec<OrderByStyle>>,
-) -> Option<(FieldName, SortDirection)> {
-    let first_pathkey_style = pathkeys?.first()?;
-    let (pathkey, expected_field) = match first_pathkey_style {
-        OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.clone()),
-        OrderByStyle::Score(_) => return None,
-    };
+#[derive(Debug, Clone)]
+struct PartitionOrderingKey {
+    field: FieldName,
+    direction: SortDirection,
+}
 
-    let equivclass = (*pathkey).pk_eclass;
-    let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
-    let var_context = VarContext::from_planner(root);
+impl PartitionOrderingKey {
+    unsafe fn first_raw_from_pathkeys(
+        root: *mut pg_sys::PlannerInfo,
+        pathkeys: Option<&Vec<OrderByStyle>>,
+    ) -> Option<Self> {
+        let first_pathkey_style = pathkeys?.first()?;
+        let (pathkey, expected_field) = match first_pathkey_style {
+            OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.clone()),
+            OrderByStyle::Score(_) => return None,
+        };
 
-    let mut found_matching_raw_column = false;
-    for member in members.iter_ptr() {
-        if let Some((SortExpressionType::Raw, _, Some(field_name))) =
-            analyze_sort_expression((*member).em_expr.cast(), var_context)
-        {
-            if field_name == expected_field {
-                found_matching_raw_column = true;
-                break;
+        let equivclass = (*pathkey).pk_eclass;
+        let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+        let var_context = VarContext::from_planner(root);
+
+        let mut found_matching_raw_column = false;
+        for member in members.iter_ptr() {
+            if let Some((SortExpressionType::Raw, _, Some(field_name))) =
+                analyze_sort_expression((*member).em_expr.cast(), var_context)
+            {
+                if field_name == expected_field {
+                    found_matching_raw_column = true;
+                    break;
+                }
             }
+        }
+
+        if !found_matching_raw_column {
+            return None;
+        }
+
+        Some(Self {
+            field: expected_field,
+            direction: first_pathkey_style.direction(),
+        })
+    }
+
+    unsafe fn try_new(
+        root: *mut pg_sys::PlannerInfo,
+        child_oid: pg_sys::Oid,
+        pathkeys: Option<&Vec<OrderByStyle>>,
+    ) -> Option<Self> {
+        let ordering_key = Self::first_raw_from_pathkeys(root, pathkeys)?;
+        let parent_oid = get_partition_parent(child_oid, false);
+        if parent_oid == pg_sys::InvalidOid {
+            return None;
+        }
+        let partition_col = range_partition_key_column_without_default(parent_oid)?;
+
+        if ordering_key.field == partition_col {
+            Some(ordering_key)
+        } else {
+            None
         }
     }
 
-    if !found_matching_raw_column {
-        return None;
+    fn sort_direction(&self) -> SortDirection {
+        self.direction
     }
-
-    Some((expected_field, first_pathkey_style.direction()))
 }
 
 unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<FieldName> {
@@ -525,25 +559,6 @@ unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) ->
         pg_sys::pfree(attname_ptr.cast());
         Some(attname.into())
     })()
-}
-
-unsafe fn partition_early_term_sort_direction_if_safe(
-    root: *mut pg_sys::PlannerInfo,
-    child_oid: pg_sys::Oid,
-    pathkeys: Option<&Vec<OrderByStyle>>,
-) -> Option<SortDirection> {
-    let (orderby_col, sort_direction) = first_raw_orderby_field_and_direction(root, pathkeys)?;
-    let parent_oid = get_partition_parent(child_oid, false);
-    if parent_oid == pg_sys::InvalidOid {
-        return None;
-    }
-    let partition_col = range_partition_key_column_without_default(parent_oid)?;
-
-    if orderby_col == partition_col {
-        Some(sort_direction)
-    } else {
-        None
-    }
 }
 
 impl CustomScan for BaseScan {
@@ -872,16 +887,8 @@ impl CustomScan for BaseScan {
             let startup_cost = DEFAULT_STARTUP_COST;
             let mut custom_paths = Vec::new();
 
-            let is_partition_child = get_partition_parent(table.oid(), false) != pg_sys::InvalidOid;
-            let partition_early_term_sort_direction = if is_partition_child {
-                partition_early_term_sort_direction_if_safe(
-                    root,
-                    table.oid(),
-                    topn_pathkey_info.pathkeys(),
-                )
-            } else {
-                None
-            };
+            let partition_ordering_key =
+                PartitionOrderingKey::try_new(root, table.oid(), topn_pathkey_info.pathkeys());
 
             // For each execution method variant (e.g. sorted vs unsorted), we build a separate
             // CustomPath. This allows the Postgres planner to choose the most efficient
@@ -983,7 +990,7 @@ impl CustomScan for BaseScan {
                 // Mark the parallel path as eligible for cross-partition early termination only
                 // when this is a TopN path and partition order can be proven to match ORDER BY.
                 if nworkers > 0
-                    && is_partition_child
+                    && partition_ordering_key.is_some()
                     && matches!(
                         method,
                         ExecMethodType::TopN {
@@ -992,9 +999,10 @@ impl CustomScan for BaseScan {
                         }
                     )
                 {
-                    if let Some(sort_direction) = partition_early_term_sort_direction {
+                    if let Some(partition_ordering_key) = partition_ordering_key.as_ref() {
                         method_private.set_partition_early_term_eligible(true);
-                        method_private.set_partition_sort_direction(sort_direction);
+                        method_private
+                            .set_partition_sort_direction(partition_ordering_key.sort_direction());
                     }
                 }
 
