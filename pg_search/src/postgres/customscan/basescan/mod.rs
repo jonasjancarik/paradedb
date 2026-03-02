@@ -503,24 +503,9 @@ impl PartitionOrderingKey {
         if parent_oid == pg_sys::InvalidOid {
             return None;
         }
-        let partition_col = range_partition_key_column_without_default(parent_oid)?;
 
-        if ordering_key.field == partition_col {
-            Some(ordering_key)
-        } else {
-            None
-        }
-    }
+        let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
 
-    fn sort_direction(&self) -> SortDirection {
-        self.direction
-    }
-}
-
-unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<FieldName> {
-    let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
-
-    (|| {
         if pg_sys::get_rel_relkind(parent_oid) as u8 != pg_sys::RELKIND_PARTITIONED_TABLE {
             return None;
         }
@@ -546,19 +531,24 @@ unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) ->
         }
 
         let first_attnum = *(*partition_key).partattrs;
-        if first_attnum == pg_sys::InvalidAttrNumber as pg_sys::AttrNumber {
+        if first_attnum <= 0 || first_attnum == pg_sys::InvalidAttrNumber as pg_sys::AttrNumber {
             return None;
         }
 
-        let attname_ptr = pg_sys::get_attname(parent_oid, first_attnum, false);
-        if attname_ptr.is_null() {
-            return None;
-        }
+        let att_index = (first_attnum as usize).checked_sub(1)?;
+        let tuple_desc = parent_rel.tuple_desc();
+        let partition_att = tuple_desc.get(att_index)?;
 
-        let attname = CStr::from_ptr(attname_ptr).to_string_lossy().into_owned();
-        pg_sys::pfree(attname_ptr.cast());
-        Some(attname.into())
-    })()
+        if ordering_key.field.as_ref() == partition_att.name() {
+            Some(ordering_key)
+        } else {
+            None
+        }
+    }
+
+    fn sort_direction(&self) -> SortDirection {
+        self.direction
+    }
 }
 
 impl CustomScan for BaseScan {
