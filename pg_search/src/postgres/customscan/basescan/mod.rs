@@ -455,42 +455,6 @@ struct PartitionOrderingKey {
     direction: SortDirection,
 }
 
-unsafe fn partition_parent_oid_from_append_rel(
-    root: *mut pg_sys::PlannerInfo,
-    child_rti: pg_sys::Index,
-) -> Option<pg_sys::Oid> {
-    if root.is_null() || (*root).append_rel_list.is_null() || (*root).parse.is_null() {
-        return None;
-    }
-
-    let append_rels = PgList::<pg_sys::AppendRelInfo>::from_pg((*root).append_rel_list);
-    let mut parent_rti = None;
-    for appinfo in append_rels.iter_ptr() {
-        if (*appinfo).child_relid == child_rti {
-            parent_rti = Some((*appinfo).parent_relid);
-            break;
-        }
-    }
-    let parent_rti = parent_rti?;
-
-    if parent_rti == 0 {
-        return None;
-    }
-
-    let rtable = PgList::<pg_sys::RangeTblEntry>::from_pg((*(*root).parse).rtable);
-    let parent_rte = rtable.get_ptr((parent_rti as usize).checked_sub(1)?)?;
-    if (*parent_rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
-        return None;
-    }
-
-    let parent_oid = (*parent_rte).relid;
-    if parent_oid == pg_sys::InvalidOid {
-        None
-    } else {
-        Some(parent_oid)
-    }
-}
-
 impl PartitionOrderingKey {
     unsafe fn first_raw_from_pathkeys(
         root: *mut pg_sys::PlannerInfo,
@@ -534,23 +498,55 @@ impl PartitionOrderingKey {
         child_rel: &PgSearchRelation,
         pathkeys: Option<&Vec<OrderByStyle>>,
     ) -> Option<Self> {
+        // Extract the ordering key from pathkeys — must be a raw column sort, not score
         let ordering_key = Self::first_raw_from_pathkeys(root, pathkeys)?;
+
+        // The child relation must itself be a partition
         if !(*child_rel.rd_rel).relispartition {
             return None;
         }
-        let parent_oid = partition_parent_oid_from_append_rel(root, child_rti)?;
 
-        let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
+        // Walk the planner's append_rel_list to find the parent RTI for this child
+        if root.is_null() || (*root).append_rel_list.is_null() || (*root).parse.is_null() {
+            return None;
+        }
+        let append_rels = PgList::<pg_sys::AppendRelInfo>::from_pg((*root).append_rel_list);
+        let mut parent_rti = None;
+        for appinfo in append_rels.iter_ptr() {
+            if (*appinfo).child_relid == child_rti {
+                parent_rti = Some((*appinfo).parent_relid);
+                break;
+            }
+        }
+        let parent_rti = parent_rti?;
+        if parent_rti == 0 {
+            return None;
+        }
 
+        // Resolve the parent RTI to an OID via the query's range table
+        let rtable = PgList::<pg_sys::RangeTblEntry>::from_pg((*(*root).parse).rtable);
+        let parent_rte = rtable.get_ptr((parent_rti as usize).checked_sub(1)?)?;
+        if (*parent_rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            return None;
+        }
+        let parent_oid = (*parent_rte).relid;
+        if parent_oid == pg_sys::InvalidOid {
+            return None;
+        }
+
+        // The parent must be a partitioned table
         if pg_sys::get_rel_relkind(parent_oid) as u8 != pg_sys::RELKIND_PARTITIONED_TABLE {
             return None;
         }
 
+        // Open the parent relation and inspect its partition key
+        let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
         let partition_key = relation_get_partition_key(parent_rel.as_ptr());
         if partition_key.is_null() {
             return None;
         }
 
+        // Only RANGE-partitioned tables with a single plain-column key are eligible
         let partition_key = partition_key.cast::<PartitionKeyDataCompat>();
         if (*partition_key).strategy != pg_sys::PartitionStrategy::PARTITION_STRATEGY_RANGE {
             return None;
@@ -562,15 +558,16 @@ impl PartitionOrderingKey {
             return None;
         }
 
+        // A default partition would break sorted-append ordering guarantees
         if get_default_partition_oid(parent_oid) != pg_sys::InvalidOid {
             return None;
         }
 
+        // The partition key column must match the ORDER BY field
         let first_attnum = *(*partition_key).partattrs;
         if first_attnum <= 0 || first_attnum == pg_sys::InvalidAttrNumber as pg_sys::AttrNumber {
             return None;
         }
-
         let att_index = (first_attnum as usize).checked_sub(1)?;
         let tuple_desc = parent_rel.tuple_desc();
         let partition_att = tuple_desc.get(att_index)?;
