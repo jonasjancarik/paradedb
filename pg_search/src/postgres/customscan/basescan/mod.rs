@@ -83,12 +83,27 @@ use crate::schema::SearchIndexSchema;
 use crate::{nodecast, DEFAULT_STARTUP_COST, PARAMETERIZED_SELECTIVITY, UNKNOWN_SELECTIVITY};
 use crate::{FULL_RELATION_SELECTIVITY, UNASSIGNED_SELECTIVITY};
 
-use pgrx::{direct_function_call, pg_sys, FromDatum, IntoDatum, PgList, PgMemoryContexts, Spi};
+use pgrx::{direct_function_call, pg_sys, FromDatum, IntoDatum, PgList, PgMemoryContexts};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::Index;
 
 #[derive(Default)]
 pub struct BaseScan;
+
+extern "C" {
+    fn get_partition_parent(partition_oid: pg_sys::Oid, even_if_detached: bool) -> pg_sys::Oid;
+    fn get_default_partition_oid(parent_oid: pg_sys::Oid) -> pg_sys::Oid;
+    #[link_name = "RelationGetPartitionKey"]
+    fn relation_get_partition_key(rel: pg_sys::Relation) -> pg_sys::PartitionKey;
+}
+
+#[repr(C)]
+struct PartitionKeyDataCompat {
+    strategy: pg_sys::PartitionStrategy::Type,
+    partnatts: i16,
+    partattrs: *mut pg_sys::AttrNumber,
+    partexprs: *mut pg_sys::List,
+}
 
 impl BaseScan {
     /// (Re-)initializes the search reader for the current execution context.
@@ -486,15 +501,7 @@ unsafe fn first_raw_orderby_field_and_direction(
 }
 
 unsafe fn partition_parent_oid(child_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
-    let parent_oid = Spi::get_one_with_args::<pg_sys::Oid>(
-        "SELECT inhparent
-         FROM pg_inherits
-         WHERE inhrelid = $1
-         LIMIT 1",
-        &[child_oid.into()],
-    )
-    .ok()
-    .flatten()?;
+    let parent_oid = get_partition_parent(child_oid, false);
 
     if parent_oid == pg_sys::InvalidOid {
         None
@@ -504,23 +511,50 @@ unsafe fn partition_parent_oid(child_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
 }
 
 unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<String> {
-    Spi::get_one_with_args::<String>(
-        "SELECT a.attname::text
-         FROM pg_partitioned_table p
-         JOIN LATERAL unnest(p.partattrs::smallint[]) WITH ORDINALITY AS k(attnum, ord)
-           ON ord = 1
-         JOIN pg_attribute a
-           ON a.attrelid = p.partrelid
-          AND a.attnum = k.attnum
-         WHERE p.partrelid = $1
-           AND p.partstrat = 'r'
-           AND p.partnatts = 1
-           AND p.partdefid = '0'::oid
-           AND p.partexprs IS NULL",
-        &[parent_oid.into()],
-    )
-    .ok()
-    .flatten()
+    let parent_rel = pg_sys::relation_open(parent_oid, pg_sys::AccessShareLock as _);
+
+    let result = (|| {
+        if pg_sys::get_rel_relkind(parent_oid) as u8 != pg_sys::RELKIND_PARTITIONED_TABLE {
+            return None;
+        }
+
+        let partition_key = relation_get_partition_key(parent_rel);
+        if partition_key.is_null() {
+            return None;
+        }
+
+        let partition_key = partition_key.cast::<PartitionKeyDataCompat>();
+        if (*partition_key).strategy != pg_sys::PartitionStrategy::PARTITION_STRATEGY_RANGE {
+            return None;
+        }
+        if (*partition_key).partnatts != 1
+            || (*partition_key).partattrs.is_null()
+            || !(*partition_key).partexprs.is_null()
+        {
+            return None;
+        }
+
+        if get_default_partition_oid(parent_oid) != pg_sys::InvalidOid {
+            return None;
+        }
+
+        let first_attnum = *(*partition_key).partattrs;
+        if first_attnum == pg_sys::InvalidAttrNumber as pg_sys::AttrNumber {
+            return None;
+        }
+
+        let attname_ptr = pg_sys::get_attname(parent_oid, first_attnum, false);
+        if attname_ptr.is_null() {
+            return None;
+        }
+
+        let attname = CStr::from_ptr(attname_ptr).to_string_lossy().into_owned();
+        pg_sys::pfree(attname_ptr.cast());
+        Some(attname)
+    })();
+
+    pg_sys::relation_close(parent_rel, pg_sys::AccessShareLock as _);
+    result
 }
 
 unsafe fn partition_early_term_sort_desc_if_safe(
