@@ -15,7 +15,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::{AsCStr, Cardinality, FieldName, HashMap, HashSet, OrderByInfo, Varno};
+use crate::api::{
+    AsCStr, Cardinality, FieldName, HashMap, HashSet, OrderByInfo, SortDirection, Varno,
+};
 use crate::index::fast_fields_helper::WhichFastField;
 use crate::postgres::customscan::basescan::projections::window_agg::WindowAggregateInfo;
 use crate::postgres::customscan::basescan::ExecMethodType;
@@ -59,8 +61,8 @@ pub struct PrivateData {
     // Whether this parallel path is eligible for cross-partition early termination.
     // Set at plan time for sorted TopN on partition children with nworkers > 0.
     partition_early_term_eligible: bool,
-    // Whether the partition sort order is descending (for early termination rank computation).
-    partition_sort_desc: bool,
+    // Partition sort direction used for early termination rank computation.
+    partition_sort_direction: SortDirection,
 }
 
 mod var_attname_lookup_serializer {
@@ -243,8 +245,8 @@ impl PrivateData {
         self.partition_early_term_eligible = eligible;
     }
 
-    pub fn set_partition_sort_desc(&mut self, is_desc: bool) {
-        self.partition_sort_desc = is_desc;
+    pub fn set_partition_sort_direction(&mut self, direction: SortDirection) {
+        self.partition_sort_direction = direction;
     }
 }
 
@@ -326,7 +328,7 @@ impl PrivateData {
         self.partition_early_term_eligible
     }
 
-    pub fn partition_sort_desc(&self) -> bool {
-        self.partition_sort_desc
+    pub fn partition_sort_direction(&self) -> SortDirection {
+        self.partition_sort_direction
     }
 }

@@ -17,7 +17,7 @@
 
 use std::cell::UnsafeCell;
 
-use crate::api::{FieldName, HashMap, OrderByInfo, Varno};
+use crate::api::{FieldName, HashMap, OrderByInfo, SortDirection, Varno};
 use crate::customscan::CustomScanState;
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::customscan::basescan::exec_methods::ExecMethod;
@@ -46,7 +46,7 @@ pub struct BaseScanState {
     pub early_term_state: Option<*mut PartitionEarlyTermState>,
     pub partition_sort_rank: Option<usize>,
     pub partition_early_term_eligible: bool,
-    pub partition_sort_desc: bool,
+    pub partition_sort_direction: SortDirection,
 
     // Note: the range table index at execution time might be different from the one at planning time,
     // so we need to use the one at execution time when creating the custom scan state.

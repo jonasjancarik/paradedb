@@ -29,7 +29,7 @@ use std::sync::Once;
 
 use crate::api::operator::{anyelement_query_input_opoid, estimate_selectivity};
 use crate::api::window_aggregate::window_agg_oid;
-use crate::api::{HashMap, HashSet, OrderByFeature, OrderByInfo, SortDirection, Varno};
+use crate::api::{FieldName, HashMap, HashSet, OrderByFeature, OrderByInfo, SortDirection, Varno};
 use crate::gucs;
 use crate::index::fast_fields_helper::WhichFastField;
 use crate::index::mvcc::MvccSatisfies;
@@ -56,8 +56,8 @@ use crate::postgres::customscan::builders::custom_state::{
 };
 use crate::postgres::customscan::explainer::Explainer;
 use crate::postgres::customscan::orderby::{
-    extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey, PathKeyInfo,
-    UnusableReason,
+    analyze_sort_expression, extract_pathkey_styles_with_sortability_check, find_sort_by_pathkey,
+    PathKeyInfo, SortExpressionType, UnusableReason,
 };
 use crate::postgres::customscan::parallel::{compute_nworkers, list_segment_ids, RowEstimate};
 use crate::postgres::customscan::projections::{
@@ -77,6 +77,7 @@ use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::rel_get_bm25_index;
 use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::utils::filter_implied_predicates;
+use crate::postgres::var::VarContext;
 use crate::query::pdb_query::pdb;
 use crate::query::SearchQueryInput;
 use crate::schema::SearchIndexSchema;
@@ -449,43 +450,29 @@ unsafe fn maybe_limit_from_parse(root: *mut pg_sys::PlannerInfo) -> Option<f64> 
     }
 }
 
-unsafe fn is_raw_orderby_target_expr(node: *mut pg_sys::Node) -> bool {
-    if node.is_null() {
-        return false;
-    }
-
-    if nodecast!(Var, T_Var, node).is_some() {
-        return true;
-    }
-
-    if let Some(relabel) = nodecast!(RelabelType, T_RelabelType, node) {
-        return is_raw_orderby_target_expr((*relabel).arg.cast());
-    }
-
-    if let Some(phv) = nodecast!(PlaceHolderVar, T_PlaceHolderVar, node) {
-        return is_raw_orderby_target_expr((*phv).phexpr.cast());
-    }
-
-    false
-}
-
 unsafe fn first_raw_orderby_field_and_direction(
+    root: *mut pg_sys::PlannerInfo,
     pathkeys: Option<&Vec<OrderByStyle>>,
-) -> Option<(String, bool)> {
+) -> Option<(FieldName, SortDirection)> {
     let first_pathkey_style = pathkeys?.first()?;
     let (pathkey, expected_field) = match first_pathkey_style {
-        OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.root()),
+        OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.clone()),
         OrderByStyle::Score(_) => return None,
     };
 
     let equivclass = (*pathkey).pk_eclass;
     let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+    let var_context = VarContext::from_planner(root);
 
     let mut found_matching_raw_column = false;
     for member in members.iter_ptr() {
-        if is_raw_orderby_target_expr((*member).em_expr.cast()) {
-            found_matching_raw_column = true;
-            break;
+        if let Some((SortExpressionType::Raw, _, Some(field_name))) =
+            analyze_sort_expression((*member).em_expr.cast(), var_context)
+        {
+            if field_name == expected_field {
+                found_matching_raw_column = true;
+                break;
+            }
         }
     }
 
@@ -493,32 +480,18 @@ unsafe fn first_raw_orderby_field_and_direction(
         return None;
     }
 
-    let is_desc = matches!(
-        first_pathkey_style.direction(),
-        SortDirection::DescNullsFirst | SortDirection::DescNullsLast
-    );
-    Some((expected_field, is_desc))
+    Some((expected_field, first_pathkey_style.direction()))
 }
 
-unsafe fn partition_parent_oid(child_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
-    let parent_oid = get_partition_parent(child_oid, false);
+unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<FieldName> {
+    let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
 
-    if parent_oid == pg_sys::InvalidOid {
-        None
-    } else {
-        Some(parent_oid)
-    }
-}
-
-unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) -> Option<String> {
-    let parent_rel = pg_sys::relation_open(parent_oid, pg_sys::AccessShareLock as _);
-
-    let result = (|| {
+    (|| {
         if pg_sys::get_rel_relkind(parent_oid) as u8 != pg_sys::RELKIND_PARTITIONED_TABLE {
             return None;
         }
 
-        let partition_key = relation_get_partition_key(parent_rel);
+        let partition_key = relation_get_partition_key(parent_rel.as_ptr());
         if partition_key.is_null() {
             return None;
         }
@@ -550,23 +523,24 @@ unsafe fn range_partition_key_column_without_default(parent_oid: pg_sys::Oid) ->
 
         let attname = CStr::from_ptr(attname_ptr).to_string_lossy().into_owned();
         pg_sys::pfree(attname_ptr.cast());
-        Some(attname)
-    })();
-
-    pg_sys::relation_close(parent_rel, pg_sys::AccessShareLock as _);
-    result
+        Some(attname.into())
+    })()
 }
 
-unsafe fn partition_early_term_sort_desc_if_safe(
+unsafe fn partition_early_term_sort_direction_if_safe(
+    root: *mut pg_sys::PlannerInfo,
     child_oid: pg_sys::Oid,
     pathkeys: Option<&Vec<OrderByStyle>>,
-) -> Option<bool> {
-    let (orderby_col, is_desc) = first_raw_orderby_field_and_direction(pathkeys)?;
-    let parent_oid = partition_parent_oid(child_oid)?;
+) -> Option<SortDirection> {
+    let (orderby_col, sort_direction) = first_raw_orderby_field_and_direction(root, pathkeys)?;
+    let parent_oid = get_partition_parent(child_oid, false);
+    if parent_oid == pg_sys::InvalidOid {
+        return None;
+    }
     let partition_col = range_partition_key_column_without_default(parent_oid)?;
 
     if orderby_col == partition_col {
-        Some(is_desc)
+        Some(sort_direction)
     } else {
         None
     }
@@ -898,9 +872,13 @@ impl CustomScan for BaseScan {
             let startup_cost = DEFAULT_STARTUP_COST;
             let mut custom_paths = Vec::new();
 
-            let is_partition_child = partition_parent_oid(table.oid()).is_some();
-            let partition_early_term_sort_desc = if is_partition_child {
-                partition_early_term_sort_desc_if_safe(table.oid(), topn_pathkey_info.pathkeys())
+            let is_partition_child = get_partition_parent(table.oid(), false) != pg_sys::InvalidOid;
+            let partition_early_term_sort_direction = if is_partition_child {
+                partition_early_term_sort_direction_if_safe(
+                    root,
+                    table.oid(),
+                    topn_pathkey_info.pathkeys(),
+                )
             } else {
                 None
             };
@@ -1014,9 +992,9 @@ impl CustomScan for BaseScan {
                         }
                     )
                 {
-                    if let Some(is_desc) = partition_early_term_sort_desc {
+                    if let Some(sort_direction) = partition_early_term_sort_direction {
                         method_private.set_partition_early_term_eligible(true);
-                        method_private.set_partition_sort_desc(is_desc);
+                        method_private.set_partition_sort_direction(sort_direction);
                     }
                 }
 
@@ -1273,8 +1251,8 @@ impl CustomScan for BaseScan {
 
             builder.custom_state().partition_early_term_eligible =
                 builder.custom_private().partition_early_term_eligible();
-            builder.custom_state().partition_sort_desc =
-                builder.custom_private().partition_sort_desc();
+            builder.custom_state().partition_sort_direction =
+                builder.custom_private().partition_sort_direction();
 
             assign_exec_method(&mut builder);
 
