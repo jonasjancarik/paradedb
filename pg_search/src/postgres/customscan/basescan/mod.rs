@@ -456,16 +456,21 @@ struct PartitionOrderingKey {
 }
 
 impl PartitionOrderingKey {
-    unsafe fn first_raw_from_pathkeys(
+    unsafe fn try_new(
         root: *mut pg_sys::PlannerInfo,
+        child_rti: pg_sys::Index,
+        child_rel: &PgSearchRelation,
         pathkeys: Option<&Vec<OrderByStyle>>,
     ) -> Option<Self> {
+        // Extract the first pathkey — must be a column sort, not a score sort
         let first_pathkey_style = pathkeys?.first()?;
         let (pathkey, expected_field) = match first_pathkey_style {
             OrderByStyle::Field(pathkey, field_name) => (*pathkey, field_name.clone()),
             OrderByStyle::Score(_) => return None,
         };
 
+        // Verify the pathkey's equivalence class contains a raw (non-Tantivy) column
+        // matching the expected field name
         let equivclass = (*pathkey).pk_eclass;
         let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
         let var_context = VarContext::from_planner(root);
@@ -486,20 +491,10 @@ impl PartitionOrderingKey {
             return None;
         }
 
-        Some(Self {
+        let ordering_key = Self {
             field: expected_field,
             direction: first_pathkey_style.direction(),
-        })
-    }
-
-    unsafe fn try_new(
-        root: *mut pg_sys::PlannerInfo,
-        child_rti: pg_sys::Index,
-        child_rel: &PgSearchRelation,
-        pathkeys: Option<&Vec<OrderByStyle>>,
-    ) -> Option<Self> {
-        // Extract the ordering key from pathkeys — must be a raw column sort, not score
-        let ordering_key = Self::first_raw_from_pathkeys(root, pathkeys)?;
+        };
 
         // The child relation must itself be a partition
         if !(*child_rel.rd_rel).relispartition {
