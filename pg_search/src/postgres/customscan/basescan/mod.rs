@@ -46,7 +46,7 @@ use crate::postgres::customscan::basescan::projections::window_agg::{
     deserialize_window_agg_placeholders, resolve_window_aggregate_filters_at_plan_time,
     WindowAggregateInfo,
 };
-use crate::postgres::customscan::basescan::scan_state::BaseScanState;
+use crate::postgres::customscan::basescan::scan_state::{BaseScanState, PartitionEarlyTerm};
 use crate::postgres::customscan::builders::custom_path::{
     restrict_info, CustomPathBuilder, ExecMethodType, Flags, OrderByStyle, RestrictInfoType,
 };
@@ -1015,6 +1015,7 @@ impl CustomScan for BaseScan {
                 // when this is a TopN path and partition order can be proven to match ORDER BY.
                 if nworkers > 0
                     && partition_ordering_key.is_some()
+                    && gucs::enable_partition_early_term()
                     && matches!(
                         method,
                         ExecMethodType::TopN {
@@ -1281,10 +1282,13 @@ impl CustomScan for BaseScan {
             builder.custom_state().ambulkdelete_epoch =
                 builder.custom_private().ambulkdelete_epoch();
 
-            builder.custom_state().partition_early_term_eligible =
-                builder.custom_private().partition_early_term_eligible();
-            builder.custom_state().partition_sort_direction =
-                builder.custom_private().partition_sort_direction();
+            if builder.custom_private().partition_early_term_eligible() {
+                builder.custom_state().partition_early_term = Some(PartitionEarlyTerm {
+                    shared_state: None,
+                    sort_rank: None,
+                    sort_direction: builder.custom_private().partition_sort_direction(),
+                });
+            }
 
             assign_exec_method(&mut builder);
 
@@ -1391,10 +1395,14 @@ impl CustomScan for BaseScan {
                     state.custom_state().total_query_count().try_into().unwrap(),
                     None,
                 );
-                explainer.add_bool(
-                    "   Terminated Early",
-                    state.custom_state().terminated_early(),
-                );
+                if gucs::enable_partition_early_term()
+                    && state.custom_state().partition_early_term.is_some()
+                {
+                    explainer.add_bool(
+                        "   Terminated Early",
+                        state.custom_state().terminated_early(),
+                    );
+                }
             }
         }
 
@@ -1519,13 +1527,12 @@ impl CustomScan for BaseScan {
         loop {
             // Check cross-partition early termination: if earlier partitions have already
             // produced enough results for the LIMIT, stop scanning this partition.
-            if let (Some(et_state), Some(rank)) = (
-                state.custom_state().early_term_state,
-                state.custom_state().partition_sort_rank,
-            ) {
-                if unsafe { (*et_state).should_terminate(rank) } {
-                    state.custom_state_mut().mark_terminated_early();
-                    return std::ptr::null_mut();
+            if let Some(et) = state.custom_state().partition_early_term.as_ref() {
+                if let (Some(et_state), Some(rank)) = (et.shared_state, et.sort_rank) {
+                    if unsafe { (*et_state).should_terminate(rank) } {
+                        state.custom_state_mut().mark_terminated_early();
+                        return std::ptr::null_mut();
+                    }
                 }
             }
 
@@ -1551,11 +1558,13 @@ impl CustomScan for BaseScan {
                                 exec_method.increment_visible();
 
                                 // Increment cross-partition early termination counter
-                                if let (Some(et_state), Some(rank)) = (
-                                    state.custom_state().early_term_state,
-                                    state.custom_state().partition_sort_rank,
-                                ) {
-                                    (*et_state).increment_results(rank);
+                                if let Some(et) = state.custom_state().partition_early_term.as_ref()
+                                {
+                                    if let (Some(et_state), Some(rank)) =
+                                        (et.shared_state, et.sort_rank)
+                                    {
+                                        (*et_state).increment_results(rank);
+                                    }
                                 }
 
                                 slot

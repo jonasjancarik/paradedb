@@ -39,14 +39,19 @@ use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::{pg_sys, PgTupleDesc};
 use tantivy::snippet::SnippetGenerator;
 
+/// Cross-partition early termination state for sorted TopN on partitioned tables.
+/// Present only when the scan is a partition child eligible for early termination.
+pub struct PartitionEarlyTerm {
+    pub shared_state: Option<*mut PartitionEarlyTermState>,
+    pub sort_rank: Option<usize>,
+    pub sort_direction: SortDirection,
+}
+
 #[derive(Default)]
 pub struct BaseScanState {
     pub parallel_state: Option<*mut ParallelScanState>,
     pub parallel_explain_data: Option<ParallelExplainData>,
-    pub early_term_state: Option<*mut PartitionEarlyTermState>,
-    pub partition_sort_rank: Option<usize>,
-    pub partition_early_term_eligible: bool,
-    pub partition_sort_direction: SortDirection,
+    pub partition_early_term: Option<PartitionEarlyTerm>,
 
     // Note: the range table index at execution time might be different from the one at planning time,
     // so we need to use the one at execution time when creating the custom scan state.

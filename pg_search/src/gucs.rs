@@ -122,6 +122,9 @@ static MIN_ROWS_PER_WORKER: GucSetting<i32> = GucSetting::<i32>::new(300000);
 /// its threshold between batches.
 static DYNAMIC_FILTER_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// Enable cross-partition early termination for sorted TopN on partitioned tables.
+static ENABLE_PARTITION_EARLY_TERM: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 pub fn init() {
     // Note that Postgres is very specific about the naming convention of variables.
     // They must be namespaced... we use 'paradedb.<variable>' below.
@@ -369,6 +372,16 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"paradedb.enable_partition_early_term",
+        c"Enable cross-partition early termination for sorted TopN on partitioned tables",
+        c"When enabled, partitions ordered by partition key with LIMIT can skip scanning \
+          if earlier partitions already produced enough results. Default is true.",
+        &ENABLE_PARTITION_EARLY_TERM,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 pub fn enable_custom_scan() -> bool {
@@ -535,6 +548,10 @@ pub fn add_doc_count_to_aggs() -> bool {
 
 pub fn dynamic_filter_batch_size() -> i32 {
     DYNAMIC_FILTER_BATCH_SIZE.get()
+}
+
+pub fn enable_partition_early_term() -> bool {
+    ENABLE_PARTITION_EARLY_TERM.get()
 }
 
 #[cfg(any(test, feature = "pg_test"))]

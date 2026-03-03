@@ -49,7 +49,7 @@ impl ParallelQueryCapable for BaseScan {
         // Each eligible partition child adds a TOC estimate for the shared
         // PartitionEarlyTermState. Over-estimation is acceptable per the PG API;
         // only one child will actually allocate during initialize_dsm.
-        if state.custom_state().partition_early_term_eligible {
+        if state.custom_state().partition_early_term.is_some() {
             unsafe {
                 estimate_keys(pcxt, 1);
                 estimate_chunk(pcxt, PartitionEarlyTermState::size_of());
@@ -72,13 +72,14 @@ impl ParallelQueryCapable for BaseScan {
             (*pscan_state).create_and_populate(args);
             state.custom_state_mut().parallel_state = Some(pscan_state);
 
-            if state.custom_state().partition_early_term_eligible {
+            if let Some(et) = state.custom_state().partition_early_term.as_ref() {
                 let toc = (*pcxt).toc;
+                let sort_direction = et.sort_direction;
 
                 // Check if another partition child already allocated the shared state.
                 let existing = pg_sys::shm_toc_lookup(toc, EARLY_TERM_TOC_KEY, true);
 
-                if existing.is_null() {
+                let shared_state = if existing.is_null() {
                     // First partition child: allocate and initialize.
                     let et_ptr = pg_sys::shm_toc_allocate(toc, PartitionEarlyTermState::size_of())
                         as *mut PartitionEarlyTermState;
@@ -88,19 +89,24 @@ impl ParallelQueryCapable for BaseScan {
                     (*et_ptr).init(limit, n_partitions);
 
                     pg_sys::shm_toc_insert(toc, EARLY_TERM_TOC_KEY, et_ptr as *mut c_void);
-
-                    state.custom_state_mut().early_term_state = Some(et_ptr);
+                    et_ptr
                 } else {
                     // Subsequent partition child: reuse existing.
-                    state.custom_state_mut().early_term_state =
-                        Some(existing as *mut PartitionEarlyTermState);
-                }
+                    existing as *mut PartitionEarlyTermState
+                };
 
-                let sort_direction = state.custom_state().partition_sort_direction;
-                state.custom_state_mut().partition_sort_rank = state
+                let sort_rank = state
                     .custom_state()
                     .heaprel()
                     .compute_partition_rank(sort_direction);
+
+                let et = state
+                    .custom_state_mut()
+                    .partition_early_term
+                    .as_mut()
+                    .unwrap();
+                et.shared_state = Some(shared_state);
+                et.sort_rank = sort_rank;
             }
         }
     }
@@ -115,7 +121,12 @@ impl ParallelQueryCapable for BaseScan {
         unsafe {
             (*pscan_state).reset();
 
-            if let Some(et_state) = state.custom_state().early_term_state {
+            if let Some(et_state) = state
+                .custom_state()
+                .partition_early_term
+                .as_ref()
+                .and_then(|et| et.shared_state)
+            {
                 (*et_state).reset();
             }
         }
@@ -142,14 +153,25 @@ impl ParallelQueryCapable for BaseScan {
             // Look up the shared early termination state via TOC key.
             let et_ptr = pg_sys::shm_toc_lookup(toc, EARLY_TERM_TOC_KEY, true);
             if !et_ptr.is_null() {
-                state.custom_state_mut().early_term_state =
-                    Some(et_ptr as *mut PartitionEarlyTermState);
-
-                let sort_direction = state.custom_state().partition_sort_direction;
-                state.custom_state_mut().partition_sort_rank = state
+                if let Some(sort_direction) = state
                     .custom_state()
-                    .heaprel()
-                    .compute_partition_rank(sort_direction);
+                    .partition_early_term
+                    .as_ref()
+                    .map(|et| et.sort_direction)
+                {
+                    let sort_rank = state
+                        .custom_state()
+                        .heaprel()
+                        .compute_partition_rank(sort_direction);
+
+                    let et = state
+                        .custom_state_mut()
+                        .partition_early_term
+                        .as_mut()
+                        .unwrap();
+                    et.shared_state = Some(et_ptr as *mut PartitionEarlyTermState);
+                    et.sort_rank = sort_rank;
+                }
             }
         }
     }
