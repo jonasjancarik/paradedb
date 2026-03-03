@@ -235,6 +235,7 @@ fn build_clause_df<'a>(
         let df_join_type = match join_clause.join_type {
             JoinScanJoinType::Inner => JoinType::Inner,
             JoinScanJoinType::Semi => JoinType::LeftSemi,
+            JoinScanJoinType::Anti => JoinType::LeftAnti,
             other => {
                 return Err(DataFusionError::Internal(format!(
                     "JoinScan runtime: unsupported join type {:?}",
@@ -336,10 +337,13 @@ fn build_clause_df<'a>(
                 // If not connected, it's a cross join.
 
                 // TODO: review this
-                if join_clause.join_type == JoinScanJoinType::Semi {
-                    return Err(DataFusionError::Internal(
-                        "JoinScan runtime: SEMI JOIN requires equi-join keys".into(),
-                    ));
+                if join_clause.join_type == JoinScanJoinType::Semi
+                    || join_clause.join_type == JoinScanJoinType::Anti
+                {
+                    return Err(DataFusionError::Internal(format!(
+                        "JoinScan runtime: {:?} JOIN requires equi-join keys",
+                        join_clause.join_type
+                    )));
                 }
                 df = df.join(right_df, df_join_type, &[], &[], None)?;
             } else {

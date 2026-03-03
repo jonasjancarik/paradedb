@@ -213,3 +213,51 @@ pub fn arb_semi_joins(
             join_column,
         })
 }
+
+#[derive(Clone, Debug)]
+pub struct AntiJoinExpr {
+    outer_table: String,
+    inner_table: String,
+    join_column: String,
+}
+
+impl AntiJoinExpr {
+    pub fn outer_table(&self) -> &str {
+        &self.outer_table
+    }
+
+    pub fn inner_table(&self) -> &str {
+        &self.inner_table
+    }
+
+    pub fn join_column(&self) -> &str {
+        &self.join_column
+    }
+}
+
+///
+/// Generate NOT EXISTS-based anti joins using two distinct tables and one join column.
+///
+pub fn arb_anti_joins(
+    tables_to_join: Vec<impl AsRef<str>>,
+    columns: Vec<impl AsRef<str>>,
+) -> impl Strategy<Value = AntiJoinExpr> {
+    let tables_to_join = tables_to_join
+        .into_iter()
+        .map(|tn| tn.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let join_columns = columns
+        .into_iter()
+        .map(|cn| cn.as_ref().to_string())
+        .collect::<Vec<_>>();
+
+    (
+        sample::subsequence(tables_to_join, 2),
+        sample::select(join_columns),
+    )
+        .prop_map(|(tables, join_column)| AntiJoinExpr {
+            outer_table: tables[0].clone(),
+            inner_table: tables[1].clone(),
+            join_column,
+        })
+}

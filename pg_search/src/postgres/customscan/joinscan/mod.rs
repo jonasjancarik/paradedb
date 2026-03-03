@@ -395,12 +395,15 @@ impl CustomScan for JoinScan {
             // WARNING: If enabling other join types, you MUST review the parallel partitioning
             // strategy documentation in `pg_search/src/postgres/customscan/joinscan/scan_state.rs`.
             // The current "Partition Outer / Replicate Inner" strategy is incorrect for Right/Full joins.
-            if jointype != pg_sys::JoinType::JOIN_INNER && jointype != pg_sys::JoinType::JOIN_SEMI {
+            if jointype != pg_sys::JoinType::JOIN_INNER
+                && jointype != pg_sys::JoinType::JOIN_SEMI
+                && jointype != pg_sys::JoinType::JOIN_ANTI
+            {
                 let is_user_visible_jointype = jointype <= pg_sys::JoinType::JOIN_ANTI;
                 if is_interesting && is_user_visible_jointype {
                     Self::add_planner_warning(
                             format!(
-                                "JoinScan not used: only INNER/SEMI JOIN is currently supported, got {:?}",
+                                "JoinScan not used: only INNER/SEMI/ANTI JOIN is currently supported, got {:?}",
                                 jointype
                             ),
                             &aliases,
@@ -459,11 +462,19 @@ impl CustomScan for JoinScan {
             // The current parallel strategy partitions exactly one source and replicates all
             // others. For SEMI JOIN correctness, the partitioned source must be the left side.
             // We currently enforce a conservative subset: binary base-table joins only.
-            if jointype == pg_sys::JoinType::JOIN_SEMI {
+            if jointype == pg_sys::JoinType::JOIN_SEMI || jointype == pg_sys::JoinType::JOIN_ANTI {
+                let join_name = if jointype == pg_sys::JoinType::JOIN_SEMI {
+                    "SEMI"
+                } else {
+                    "ANTI"
+                };
+
                 if outer_source_count != 1 || inner_source_count != 1 {
                     if is_interesting {
                         Self::add_planner_warning(
-                            "JoinScan not used: SEMI JOIN currently supports only binary base-table joins",
+                            format!(
+                                "JoinScan not used: {join_name} JOIN currently supports only binary base-table joins"
+                            ),
                             &aliases,
                         );
                     }
@@ -474,7 +485,9 @@ impl CustomScan for JoinScan {
                 if partitioning_idx != 0 {
                     if is_interesting {
                         Self::add_planner_warning(
-                            "JoinScan not used: SEMI JOIN requires the left side to be the largest source",
+                            format!(
+                                "JoinScan not used: {join_name} JOIN requires the left side to be the largest source"
+                            ),
                             &aliases,
                         );
                     }
