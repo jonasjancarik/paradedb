@@ -646,3 +646,125 @@ fn parallel_topn_partition_early_term_worst_case(mut conn: PgConnection) {
         );
     }
 }
+
+/// Verify that nested (multi-level) partitions disable early termination.
+/// A root table partitioned by year, with each year sub-partitioned by month,
+/// should still return correct results without early termination.
+#[rstest]
+fn nested_partition_disables_early_termination(mut conn: PgConnection) {
+    if pg_major_version(&mut conn) < 17 {
+        return;
+    }
+
+    r#"
+    BEGIN;
+        CREATE TABLE sales_nested (
+            id SERIAL,
+            sale_date DATE NOT NULL,
+            amount REAL NOT NULL,
+            description TEXT,
+            PRIMARY KEY (id, sale_date)
+        ) PARTITION BY RANGE (sale_date);
+
+        -- Year-level partitions, themselves sub-partitioned by quarter
+        CREATE TABLE sales_nested_2022 PARTITION OF sales_nested
+          FOR VALUES FROM ('2022-01-01') TO ('2023-01-01')
+          PARTITION BY RANGE (sale_date);
+
+        CREATE TABLE sales_nested_2023 PARTITION OF sales_nested
+          FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')
+          PARTITION BY RANGE (sale_date);
+
+        -- Leaf partitions for 2022
+        CREATE TABLE sales_nested_2022_q1 PARTITION OF sales_nested_2022
+          FOR VALUES FROM ('2022-01-01') TO ('2022-04-01');
+        CREATE TABLE sales_nested_2022_q2 PARTITION OF sales_nested_2022
+          FOR VALUES FROM ('2022-04-01') TO ('2022-07-01');
+        CREATE TABLE sales_nested_2022_q3 PARTITION OF sales_nested_2022
+          FOR VALUES FROM ('2022-07-01') TO ('2022-10-01');
+        CREATE TABLE sales_nested_2022_q4 PARTITION OF sales_nested_2022
+          FOR VALUES FROM ('2022-10-01') TO ('2023-01-01');
+
+        -- Leaf partitions for 2023
+        CREATE TABLE sales_nested_2023_q1 PARTITION OF sales_nested_2023
+          FOR VALUES FROM ('2023-01-01') TO ('2023-04-01');
+        CREATE TABLE sales_nested_2023_q2 PARTITION OF sales_nested_2023
+          FOR VALUES FROM ('2023-04-01') TO ('2023-07-01');
+        CREATE TABLE sales_nested_2023_q3 PARTITION OF sales_nested_2023
+          FOR VALUES FROM ('2023-07-01') TO ('2023-10-01');
+        CREATE TABLE sales_nested_2023_q4 PARTITION OF sales_nested_2023
+          FOR VALUES FROM ('2023-10-01') TO ('2024-01-01');
+
+        CREATE INDEX sales_nested_idx ON sales_nested
+          USING bm25 (id, description, sale_date, amount)
+          WITH (
+            key_field='id',
+            numeric_fields='{"amount": {"fast": true}}',
+            datetime_fields='{"sale_date": {"fast": true}}'
+          );
+
+        INSERT INTO sales_nested (sale_date, amount, description)
+        SELECT
+            (DATE '2022-01-01' + (random() * 729)::integer) AS sale_date,
+            (random() * 1000)::real AS amount,
+            ('wine '::text || md5(random()::text)) AS description
+        FROM generate_series(1, 40000);
+
+        ANALYZE sales_nested;
+    COMMIT;
+    "#
+    .execute(&mut conn);
+
+    "SET max_parallel_workers_per_gather = 4;".execute(&mut conn);
+    "SET max_parallel_workers = 8;".execute(&mut conn);
+    "SET enable_indexscan TO off;".execute(&mut conn);
+    "SET parallel_tuple_cost = 0;".execute(&mut conn);
+    "SET parallel_setup_cost = 0;".execute(&mut conn);
+
+    // Verify correct results with ORDER BY partition key and LIMIT
+    let rows: Vec<(i32, chrono::NaiveDate, f32)> = r#"
+        SELECT id, sale_date, amount FROM sales_nested
+        WHERE description @@@ 'wine'
+        ORDER BY sale_date
+        LIMIT 5;
+    "#
+    .fetch(&mut conn);
+
+    assert_eq!(rows.len(), 5, "Expected 5 result rows");
+
+    // Verify results are in ascending order
+    for w in rows.windows(2) {
+        assert!(
+            w[0].1 <= w[1].1,
+            "Results not in ASC order: {:?} > {:?}",
+            w[0].1,
+            w[1].1
+        );
+    }
+
+    // Verify that early termination is NOT used (no "Terminated Early: true" in plan)
+    let (plan,): (Value,) = r#"
+        EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
+        SELECT id, sale_date, amount FROM sales_nested
+        WHERE description @@@ 'wine'
+        ORDER BY sale_date
+        LIMIT 5;
+    "#
+    .fetch_one(&mut conn);
+
+    let root = plan.pointer("/0/Plan").unwrap();
+    let mut custom_scan_nodes = Vec::new();
+    collect_custom_scan_nodes(root, &mut custom_scan_nodes);
+
+    for node in &custom_scan_nodes {
+        let terminated_early = node
+            .get("Terminated Early")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(
+            !terminated_early,
+            "Expected no early termination for nested partitions, but found \
+             'Terminated Early: true' in plan: {node:#?}"
+        );
+    }
+}

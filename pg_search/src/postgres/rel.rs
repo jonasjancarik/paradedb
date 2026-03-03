@@ -318,6 +318,17 @@ impl PgSearchRelation {
         self.schema().map(|s| s.field_supports_aggregate(field))
     }
 
+    /// Returns the OID of this relation's immediate partition parent, or `None` if
+    /// this relation is not a partition child.
+    pub unsafe fn partition_parent_oid(&self) -> Option<pg_sys::Oid> {
+        let parent = get_partition_parent(self.oid(), false);
+        if parent == pg_sys::InvalidOid {
+            None
+        } else {
+            Some(parent)
+        }
+    }
+
     /// Compute the sort rank of this partition child within its parent's partition list.
     /// For ascending sorts, rank 0 = lowest-valued partition (first in oids list).
     /// For descending sorts, rank 0 = highest-valued partition (last in oids list).

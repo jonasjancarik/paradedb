@@ -534,6 +534,12 @@ impl PartitionOrderingKey {
             return None;
         }
 
+        // Nested (multi-level) partitioning is not supported — the child must be
+        // a direct child of the root partitioned table
+        if child_rel.partition_parent_oid() != Some(parent_oid) {
+            return None;
+        }
+
         // Open the parent relation and inspect its partition key
         let parent_rel = PgSearchRelation::with_lock(parent_oid, pg_sys::AccessShareLock as _);
         let partition_key = relation_get_partition_key(parent_rel.as_ptr());
