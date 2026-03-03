@@ -397,11 +397,19 @@ const MAX_PARTITIONS_EARLY_TERM: usize = 256;
 /// When `ORDER BY partition_key LIMIT N` is used on a partitioned table,
 /// partitions earlier in sort order may produce enough results to satisfy the LIMIT.
 /// Later partitions can then skip scanning entirely.
+///
+/// Additionally supports **segment gating**: workers assigned to higher-ranked partitions
+/// wait until all lower-ranked partitions' segments have been fully claimed before starting
+/// their own scan. This prevents wasted CPU on segments that would be discarded by early
+/// termination.
 #[repr(C)]
 pub struct PartitionEarlyTermState {
     limit: u32,
     n_partitions: u32,
     results_produced: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
+    segments_total: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
+    segments_claimed: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
+    gate_cv: ConditionVariable,
 }
 
 impl PartitionEarlyTermState {
@@ -411,6 +419,13 @@ impl PartitionEarlyTermState {
         for counter in self.results_produced.iter() {
             counter.store(0, Ordering::Relaxed);
         }
+        for counter in self.segments_total.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in self.segments_claimed.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.gate_cv.init();
     }
 
     pub fn increment_results(&self, rank: usize) {
@@ -435,8 +450,93 @@ impl PartitionEarlyTermState {
         false
     }
 
+    /// Store the total segment count for a given partition rank.
+    pub fn register_segments(&self, rank: usize, count: u32) {
+        if rank < self.n_partitions as usize {
+            self.segments_total[rank].store(count, Ordering::Release);
+            self.segments_claimed[rank].store(0, Ordering::Release);
+        }
+    }
+
+    /// Atomically increment the claimed segment count for a rank.
+    /// Broadcasts `gate_cv` when all segments for this rank have been claimed.
+    ///
+    /// Takes `*mut Self` (not `&mut self`) to allow broadcasting the CV through a raw
+    /// pointer, matching the pattern used by `ParallelScanState` for its CVs.
+    pub fn claim_segment(this: *mut Self, rank: usize) {
+        unsafe {
+            let state = &*this;
+            if rank >= state.n_partitions as usize {
+                return;
+            }
+            let prev = state.segments_claimed[rank].fetch_add(1, Ordering::Release);
+            let total = state.segments_total[rank].load(Ordering::Acquire);
+            if prev + 1 >= total {
+                // All segments for this rank have been claimed. Broadcast to wake
+                // any workers on higher ranks waiting in the gate.
+                (*this).gate_cv.broadcast();
+            }
+        }
+    }
+
+    /// Returns true if all ranks strictly less than `rank` have had all their segments claimed.
+    pub fn lower_ranks_fully_claimed(&self, rank: usize) -> bool {
+        for i in 0..rank.min(self.n_partitions as usize) {
+            let total = self.segments_total[i].load(Ordering::Acquire);
+            let claimed = self.segments_claimed[i].load(Ordering::Acquire);
+            if claimed < total {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Wait until all lower-ranked partitions' segments have been fully claimed,
+    /// or until early termination is triggered.
+    ///
+    /// Returns `true` if the scan should proceed, `false` if it should terminate early.
+    pub fn wait_for_gate(this: *mut Self, rank: usize) -> bool {
+        if rank == 0 {
+            return true;
+        }
+        unsafe {
+            loop {
+                pgrx::check_for_interrupts!();
+                (*this).gate_cv.prepare_to_sleep();
+
+                if (*this).should_terminate(rank) {
+                    ConditionVariable::cancel_sleep();
+                    return false;
+                }
+
+                if (*this).lower_ranks_fully_claimed(rank) {
+                    ConditionVariable::cancel_sleep();
+                    return true;
+                }
+
+                (*this).gate_cv.sleep();
+            }
+        }
+    }
+
+    /// Reset only a single rank's counters. Used during reinitialize to avoid the race
+    /// where one child's full `reset()` clears another child's already-registered data.
+    pub fn reset_rank(&self, rank: usize) {
+        if rank < self.n_partitions as usize {
+            self.results_produced[rank].store(0, Ordering::Relaxed);
+            self.segments_total[rank].store(0, Ordering::Relaxed);
+            self.segments_claimed[rank].store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn reset(&mut self) {
         for counter in self.results_produced.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in self.segments_total.iter() {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in self.segments_claimed.iter() {
             counter.store(0, Ordering::Relaxed);
         }
     }
@@ -880,6 +980,11 @@ impl ParallelScanState {
         self.remaining_segments = self.nsegments;
         // NOTE: We do not reset `queries_per_worker` here, so that it can be tracked across
         // rescans.
+    }
+
+    /// Returns the number of segments in this parallel scan.
+    pub fn segment_count(&self) -> usize {
+        self.nsegments
     }
 }
 

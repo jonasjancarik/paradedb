@@ -30,7 +30,7 @@ use crate::postgres::customscan::basescan::scan_state::BaseScanState;
 use crate::postgres::customscan::builders::custom_path::ExecMethodType;
 use crate::postgres::customscan::parallel::checkout_segment;
 use crate::postgres::heap::VisibilityChecker;
-use crate::postgres::ParallelScanState;
+use crate::postgres::{ParallelScanState, PartitionEarlyTermState};
 use crate::query::SearchQueryInput;
 
 use pgrx::{check_for_interrupts, direct_function_call, pg_sys, IntoDatum};
@@ -134,10 +134,15 @@ impl TopNScanExecState {
     ///    b. Nth execution: eagerly emits all segments which were previously collected. This is
     ///    necessary to allow for re-scans (when a Top-N result later proves not to be visible)
     ///    to consistently revisit the same segments.
+    ///
+    /// When `partition_et` is provided, each segment checkout is reported to the shared
+    /// `PartitionEarlyTermState` via `claim_segment`, which may broadcast the gate CV
+    /// to unblock workers waiting on higher-ranked partitions.
     fn segments_to_query<'s>(
         &'s self,
         search_reader: &SearchIndexReader,
         parallel_state: Option<*mut ParallelScanState>,
+        partition_et: Option<(*mut PartitionEarlyTermState, usize)>,
     ) -> Box<dyn Iterator<Item = SegmentId> + 's> {
         match (parallel_state, self.claimed_segments.borrow().clone()) {
             (None, _) => {
@@ -167,6 +172,11 @@ impl TopNScanExecState {
                             Some(std::mem::take(&mut claimed_segments));
                         return None;
                     };
+
+                    // Signal that we've claimed a segment for partition gating.
+                    if let Some((et_state, rank)) = partition_et {
+                        PartitionEarlyTermState::claim_segment(et_state, rank);
+                    }
 
                     // We claimed a segment. record it, and then return it.
                     claimed_segments.push(segment_id);
@@ -319,6 +329,14 @@ impl ExecMethod for TopNScanExecState {
                     state.mark_terminated_early();
                     return false;
                 }
+
+                // Gate: for rank > 0, wait until all lower-ranked partitions' segments
+                // have been fully claimed before starting our scan. Workers may also
+                // terminate early during the wait if lower ranks produce enough results.
+                if !PartitionEarlyTermState::wait_for_gate(et_state, rank) {
+                    state.mark_terminated_early();
+                    return false;
+                }
             }
         }
 
@@ -349,6 +367,14 @@ impl ExecMethod for TopNScanExecState {
             .index()
             .tokenizers()
             .clone();
+
+        // Extract partition early termination info for segment claiming.
+        let partition_et = state.partition_early_term.as_ref().and_then(|et| {
+            match (et.shared_state, et.sort_rank) {
+                (Some(shared_state), Some(rank)) => Some((shared_state, rank)),
+                _ => None,
+            }
+        });
 
         // Run the TopN (and optional aggregate) query.
         self.search_results = if let Some(orderby_info) = self.orderby_info.as_ref() {
@@ -384,6 +410,7 @@ impl ExecMethod for TopNScanExecState {
                     self.segments_to_query(
                         state.search_reader.as_ref().unwrap(),
                         state.parallel_state,
+                        partition_et,
                     ),
                     orderby_info,
                     local_limit,
@@ -398,6 +425,7 @@ impl ExecMethod for TopNScanExecState {
                     self.segments_to_query(
                         state.search_reader.as_ref().unwrap(),
                         state.parallel_state,
+                        partition_et,
                     ),
                     local_limit,
                     self.offset,

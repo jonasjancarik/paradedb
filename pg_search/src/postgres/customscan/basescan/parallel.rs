@@ -65,6 +65,7 @@ impl ParallelQueryCapable for BaseScan {
         coordinate: *mut c_void,
     ) {
         let args = state.custom_state().parallel_scan_args();
+        let nsegments = args.segment_readers.len();
 
         unsafe {
             let pscan_state = coordinate.cast::<ParallelScanState>();
@@ -107,6 +108,11 @@ impl ParallelQueryCapable for BaseScan {
                     .unwrap();
                 et.shared_state = Some(shared_state);
                 et.sort_rank = sort_rank;
+
+                // Register this partition's segment count for gating.
+                if let Some(rank) = sort_rank {
+                    (*shared_state).register_segments(rank, nsegments as u32);
+                }
             }
         }
     }
@@ -119,15 +125,17 @@ impl ParallelQueryCapable for BaseScan {
         let pscan_state = coordinate.cast::<ParallelScanState>();
         assert!(!pscan_state.is_null(), "coordinate is null");
         unsafe {
+            let nsegments = (*pscan_state).segment_count();
             (*pscan_state).reset();
 
-            if let Some(et_state) = state
-                .custom_state()
-                .partition_early_term
-                .as_ref()
-                .and_then(|et| et.shared_state)
-            {
-                (*et_state).reset();
+            if let Some(et) = state.custom_state().partition_early_term.as_ref() {
+                if let (Some(et_state), Some(rank)) = (et.shared_state, et.sort_rank) {
+                    // Reset only this rank's counters (not the full state) to avoid
+                    // the race where one child's reset clears another child's
+                    // already-registered segment count.
+                    (*et_state).reset_rank(rank);
+                    (*et_state).register_segments(rank, nsegments as u32);
+                }
             }
         }
     }
