@@ -384,27 +384,13 @@ impl CustomScan for JoinScan {
                 }
             }
 
-            // TODO(join-types): Currently only INNER JOIN is supported.
-            // Future work should add:
-            // - LEFT JOIN: Return NULL for non-matching non-ordering rows; track matched ordering rows
-            // - RIGHT JOIN: Swap ordering/non-ordering sides, then use LEFT logic
-            // - FULL OUTER JOIN: Track unmatched rows on both sides; two-pass or marking approach
-            // - SEMI JOIN: Stop after first match per ordering row (benefits EXISTS queries)
-            // - ANTI JOIN: Return only ordering rows with no matches (benefits NOT EXISTS)
-            //
-            // WARNING: If enabling other join types, you MUST review the parallel partitioning
-            // strategy documentation in `pg_search/src/postgres/customscan/joinscan/scan_state.rs`.
-            // The current "Partition Outer / Replicate Inner" strategy is incorrect for Right/Full joins.
-            if jointype != pg_sys::JoinType::JOIN_INNER
-                && jointype != pg_sys::JoinType::JOIN_SEMI
-                && jointype != pg_sys::JoinType::JOIN_ANTI
-            {
+            let join_type: build::JoinType = jointype.into();
+            if !join_type.supports_pushdown() {
                 let is_user_visible_jointype = jointype <= pg_sys::JoinType::JOIN_ANTI;
                 if is_interesting && is_user_visible_jointype {
                     Self::add_planner_warning(
                             format!(
-                                "JoinScan not used: only INNER/SEMI/ANTI JOIN is currently supported, got {:?}",
-                                jointype
+                                "JoinScan not used: only INNER/SEMI/ANTI JOIN is currently supported, got {join_type}",
                             ),
                             &aliases,
                         );
@@ -455,25 +441,19 @@ impl CustomScan for JoinScan {
             }
 
             let mut join_clause = JoinCSClause::new()
-                .with_join_type(jointype.into())
+                .with_join_type(join_type)
                 .with_limit(limit);
             join_clause.sources = sources;
 
             // The current parallel strategy partitions exactly one source and replicates all
-            // others. For SEMI JOIN correctness, the partitioned source must be the left side.
-            // We currently enforce a conservative subset: binary base-table joins only.
-            if jointype == pg_sys::JoinType::JOIN_SEMI || jointype == pg_sys::JoinType::JOIN_ANTI {
-                let join_name = if jointype == pg_sys::JoinType::JOIN_SEMI {
-                    "SEMI"
-                } else {
-                    "ANTI"
-                };
-
+            // others. For SEMI/ANTI JOIN correctness, the partitioned source must be the left
+            // side. We currently enforce a conservative subset: binary base-table joins only.
+            if join_type.requires_left_partitioning() {
                 if outer_source_count != 1 || inner_source_count != 1 {
                     if is_interesting {
                         Self::add_planner_warning(
                             format!(
-                                "JoinScan not used: {join_name} JOIN currently supports only binary base-table joins"
+                                "JoinScan not used: {join_type} JOIN currently supports only binary base-table joins"
                             ),
                             &aliases,
                         );
@@ -486,7 +466,7 @@ impl CustomScan for JoinScan {
                     if is_interesting {
                         Self::add_planner_warning(
                             format!(
-                                "JoinScan not used: {join_name} JOIN requires the left side to be the largest source"
+                                "JoinScan not used: {join_type} JOIN requires the left side to be the largest source"
                             ),
                             &aliases,
                         );

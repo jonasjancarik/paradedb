@@ -53,7 +53,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::{DataFusionError, JoinType, Result};
+use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::{col, Expr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -63,9 +63,7 @@ use pgrx::pg_sys;
 
 use crate::api::{OrderByFeature, SortDirection};
 use crate::index::fast_fields_helper::WhichFastField;
-use crate::postgres::customscan::joinscan::build::{
-    JoinCSClause, JoinSource, JoinType as JoinScanJoinType,
-};
+use crate::postgres::customscan::joinscan::build::{JoinCSClause, JoinSource};
 use crate::postgres::customscan::joinscan::planner::SortMergeJoinEnforcer;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 
@@ -235,17 +233,7 @@ fn build_clause_df<'a>(
         }
 
         let partitioning_idx = join_clause.partitioning_source_index();
-        let df_join_type = match join_clause.join_type {
-            JoinScanJoinType::Inner => JoinType::Inner,
-            JoinScanJoinType::Semi => JoinType::LeftSemi,
-            JoinScanJoinType::Anti => JoinType::LeftAnti,
-            other => {
-                return Err(DataFusionError::Internal(format!(
-                    "JoinScan runtime: unsupported join type {:?}",
-                    other
-                )));
-            }
-        };
+        let df_join_type = join_clause.join_type.to_datafusion();
 
         // 1. Start with the first source
         let mut df = build_source_df(
@@ -340,11 +328,9 @@ fn build_clause_df<'a>(
                 // If not connected, it's a cross join.
 
                 // TODO: review this
-                if join_clause.join_type == JoinScanJoinType::Semi
-                    || join_clause.join_type == JoinScanJoinType::Anti
-                {
+                if join_clause.join_type.requires_left_partitioning() {
                     return Err(DataFusionError::Internal(format!(
-                        "JoinScan runtime: {:?} JOIN requires equi-join keys",
+                        "JoinScan runtime: {} JOIN requires equi-join keys",
                         join_clause.join_type
                     )));
                 }

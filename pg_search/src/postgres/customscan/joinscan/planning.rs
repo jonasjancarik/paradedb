@@ -311,9 +311,9 @@ pub(super) unsafe fn collect_join_sources(
             let join_restrict_info = (*join_path).joinrestrictinfo;
             let join_conditions = extract_join_conditions_from_list(join_restrict_info, &sources);
 
-            // Only support Inner Join for reconstruction for now
-            let jointype = (*join_path).jointype;
-            if jointype != pg_sys::JoinType::JOIN_INNER {
+            // Only support pushdown-capable join types for reconstruction
+            let join_type: super::build::JoinType = (*join_path).jointype.into();
+            if !join_type.supports_pushdown() {
                 return None;
             }
 

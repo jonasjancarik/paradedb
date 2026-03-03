@@ -48,6 +48,29 @@ pub enum JoinType {
     Anti,
 }
 
+impl JoinType {
+    /// Returns true if this join type can be pushed down into JoinScan.
+    pub fn supports_pushdown(&self) -> bool {
+        matches!(self, JoinType::Inner | JoinType::Semi | JoinType::Anti)
+    }
+
+    /// Returns true if this join type requires the left (outer) side to be
+    /// the partitioned source for parallel correctness.
+    pub fn requires_left_partitioning(&self) -> bool {
+        matches!(self, JoinType::Semi | JoinType::Anti)
+    }
+
+    /// Convert to DataFusion's JoinType for execution.
+    pub fn to_datafusion(self) -> datafusion::common::JoinType {
+        match self {
+            JoinType::Inner => datafusion::common::JoinType::Inner,
+            JoinType::Semi => datafusion::common::JoinType::LeftSemi,
+            JoinType::Anti => datafusion::common::JoinType::LeftAnti,
+            other => panic!("JoinScan runtime: unsupported join type {other}"),
+        }
+    }
+}
+
 impl fmt::Display for JoinType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
