@@ -407,7 +407,11 @@ pub struct PartitionEarlyTermState {
     limit: u32,
     n_partitions: u32,
     results_produced: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
-    segments_total: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
+    /// Per-rank segment counts for gating. Both arrays are indexed by partition rank.
+    /// `segments_per_rank[r]` = how many segments the partition at rank `r` has.
+    /// `segments_claimed[r]`  = how many of those have been checked out by workers so far.
+    /// When `claimed >= per_rank` for all ranks below a given rank, that rank's gate opens.
+    segments_per_rank: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
     segments_claimed: [AtomicU32; MAX_PARTITIONS_EARLY_TERM],
     gate_cv: ConditionVariable,
 }
@@ -419,7 +423,7 @@ impl PartitionEarlyTermState {
         for counter in self.results_produced.iter() {
             counter.store(0, Ordering::Relaxed);
         }
-        for counter in self.segments_total.iter() {
+        for counter in self.segments_per_rank.iter() {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in self.segments_claimed.iter() {
@@ -453,7 +457,7 @@ impl PartitionEarlyTermState {
     /// Store the total segment count for a given partition rank.
     pub fn register_segments(&self, rank: usize, count: u32) {
         if rank < self.n_partitions as usize {
-            self.segments_total[rank].store(count, Ordering::Release);
+            self.segments_per_rank[rank].store(count, Ordering::Release);
             self.segments_claimed[rank].store(0, Ordering::Release);
         }
     }
@@ -470,7 +474,7 @@ impl PartitionEarlyTermState {
                 return;
             }
             let prev = state.segments_claimed[rank].fetch_add(1, Ordering::Release);
-            let total = state.segments_total[rank].load(Ordering::Acquire);
+            let total = state.segments_per_rank[rank].load(Ordering::Acquire);
             if prev + 1 >= total {
                 // All segments for this rank have been claimed. Broadcast to wake
                 // any workers on higher ranks waiting in the gate.
@@ -482,7 +486,7 @@ impl PartitionEarlyTermState {
     /// Returns true if all ranks strictly less than `rank` have had all their segments claimed.
     pub fn lower_ranks_fully_claimed(&self, rank: usize) -> bool {
         for i in 0..rank.min(self.n_partitions as usize) {
-            let total = self.segments_total[i].load(Ordering::Acquire);
+            let total = self.segments_per_rank[i].load(Ordering::Acquire);
             let claimed = self.segments_claimed[i].load(Ordering::Acquire);
             if claimed < total {
                 return false;
@@ -524,7 +528,7 @@ impl PartitionEarlyTermState {
     pub fn reset_rank(&self, rank: usize) {
         if rank < self.n_partitions as usize {
             self.results_produced[rank].store(0, Ordering::Relaxed);
-            self.segments_total[rank].store(0, Ordering::Relaxed);
+            self.segments_per_rank[rank].store(0, Ordering::Relaxed);
             self.segments_claimed[rank].store(0, Ordering::Relaxed);
         }
     }
@@ -533,7 +537,7 @@ impl PartitionEarlyTermState {
         for counter in self.results_produced.iter() {
             counter.store(0, Ordering::Relaxed);
         }
-        for counter in self.segments_total.iter() {
+        for counter in self.segments_per_rank.iter() {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in self.segments_claimed.iter() {
