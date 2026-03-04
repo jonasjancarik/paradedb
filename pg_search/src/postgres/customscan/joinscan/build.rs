@@ -46,18 +46,34 @@ pub enum JoinType {
     Right,
     Semi,
     Anti,
+    RightSemi,
+    RightAnti,
 }
 
 impl JoinType {
     /// Returns true if this join type can be pushed down into JoinScan.
     pub fn supports_pushdown(&self) -> bool {
-        matches!(self, JoinType::Inner | JoinType::Semi | JoinType::Anti)
+        matches!(
+            self,
+            JoinType::Inner
+                | JoinType::Semi
+                | JoinType::Anti
+                | JoinType::RightSemi
+                | JoinType::RightAnti
+        )
     }
 
-    /// Returns true if this join type requires the left (outer) side to be
-    /// the partitioned source for parallel correctness.
-    pub fn requires_left_partitioning(&self) -> bool {
-        matches!(self, JoinType::Semi | JoinType::Anti)
+    /// Returns the source index that must be the partitioned source for parallel
+    /// correctness, or `None` if there is no constraint (e.g. inner join).
+    ///
+    /// - Semi/Anti: the left (index 0) side must be partitioned.
+    /// - RightSemi/RightAnti: the right (index 1) side must be partitioned.
+    pub fn required_partitioning_index(&self) -> Option<usize> {
+        match self {
+            JoinType::Semi | JoinType::Anti => Some(0),
+            JoinType::RightSemi | JoinType::RightAnti => Some(1),
+            _ => None,
+        }
     }
 
     /// Convert to DataFusion's JoinType for execution.
@@ -66,6 +82,8 @@ impl JoinType {
             JoinType::Inner => datafusion::common::JoinType::Inner,
             JoinType::Semi => datafusion::common::JoinType::LeftSemi,
             JoinType::Anti => datafusion::common::JoinType::LeftAnti,
+            JoinType::RightSemi => datafusion::common::JoinType::RightSemi,
+            JoinType::RightAnti => datafusion::common::JoinType::RightAnti,
             other => panic!("JoinScan runtime: unsupported join type {other}"),
         }
     }
@@ -80,21 +98,29 @@ impl fmt::Display for JoinType {
             JoinType::Right => "Right",
             JoinType::Semi => "Semi",
             JoinType::Anti => "Anti",
+            JoinType::RightSemi => "RightSemi",
+            JoinType::RightAnti => "RightAnti",
         };
         write!(f, "{}", s)
     }
 }
 
-impl From<pg_sys::JoinType::Type> for JoinType {
-    fn from(jt: pg_sys::JoinType::Type) -> Self {
+impl TryFrom<pg_sys::JoinType::Type> for JoinType {
+    type Error = pg_sys::JoinType::Type;
+
+    fn try_from(jt: pg_sys::JoinType::Type) -> Result<Self, Self::Error> {
         match jt {
-            pg_sys::JoinType::JOIN_INNER => JoinType::Inner,
-            pg_sys::JoinType::JOIN_LEFT => JoinType::Left,
-            pg_sys::JoinType::JOIN_FULL => JoinType::Full,
-            pg_sys::JoinType::JOIN_RIGHT => JoinType::Right,
-            pg_sys::JoinType::JOIN_SEMI => JoinType::Semi,
-            pg_sys::JoinType::JOIN_ANTI => JoinType::Anti,
-            other => panic!("JoinScan: unsupported join type {:?}", other),
+            pg_sys::JoinType::JOIN_INNER => Ok(JoinType::Inner),
+            pg_sys::JoinType::JOIN_LEFT => Ok(JoinType::Left),
+            pg_sys::JoinType::JOIN_FULL => Ok(JoinType::Full),
+            pg_sys::JoinType::JOIN_RIGHT => Ok(JoinType::Right),
+            pg_sys::JoinType::JOIN_SEMI => Ok(JoinType::Semi),
+            pg_sys::JoinType::JOIN_ANTI => Ok(JoinType::Anti),
+            #[cfg(feature = "pg18")]
+            pg_sys::JoinType::JOIN_RIGHT_SEMI => Ok(JoinType::RightSemi),
+            #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+            pg_sys::JoinType::JOIN_RIGHT_ANTI => Ok(JoinType::RightAnti),
+            other => Err(other),
         }
     }
 }
@@ -455,6 +481,10 @@ pub struct JoinCSClause {
     pub order_by: Vec<OrderByInfo>,
     /// Projection of output columns for this join.
     pub output_projection: Option<Vec<ChildProjection>>,
+    /// Override for the partitioning source index (set by semi/anti join semantics).
+    /// When `Some`, this takes precedence over the default largest-source heuristic.
+    #[serde(default)]
+    pub partitioning_source_override: Option<usize>,
 }
 
 impl JoinCSClause {
@@ -568,13 +598,23 @@ impl JoinCSClause {
     }
 
     /// Returns the index of the source that should be partitioned for parallel execution.
+    /// If a partitioning override is set (e.g. for semi/anti joins), it takes precedence.
+    /// Otherwise, the largest source is chosen.
     pub fn partitioning_source_index(&self) -> usize {
+        if let Some(idx) = self.partitioning_source_override {
+            return idx;
+        }
         self.sources
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.scan_info.estimate.cmp(&b.scan_info.estimate))
             .map(|(i, _)| i)
             .expect("JoinScan requires at least one source")
+    }
+
+    /// Override which source should be partitioned for parallel execution.
+    pub fn set_partitioning_source_index(&mut self, idx: usize) {
+        self.partitioning_source_override = Some(idx);
     }
 
     /// Recursively collect all base relations in this join tree.

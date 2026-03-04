@@ -49,6 +49,13 @@ pub struct PrivateData {
     pub output_columns: Vec<OutputColumnInfo>,
     /// Serialized DataFusion LogicalPlan from planning phase.
     pub logical_plan: Option<bytes::Bytes>,
+    /// Number of multi-table predicate (heap condition) clause nodes stored in
+    /// `custom_private` after the PrivateData JSON node. Untranslated base-relation
+    /// quals (e.g. SubPlan from NOT IN) follow after these. This count lets
+    /// `plan_custom_path` split them: heap conditions go to `custom_exprs` (for
+    /// DataFusion), while untranslated quals go to `plan.qual` (for PostgreSQL).
+    #[serde(default)]
+    pub num_heap_condition_clauses: usize,
 }
 
 impl PrivateData {
@@ -57,6 +64,7 @@ impl PrivateData {
             join_clause,
             output_columns: Vec::new(),
             logical_plan: None,
+            num_heap_condition_clauses: 0,
         }
     }
 

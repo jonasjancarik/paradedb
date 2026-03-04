@@ -38,8 +38,8 @@
 //!
 //! 1. **GUC enabled**: `paradedb.enable_join_custom_scan = on` (default: on)
 //!
-//! 2. **Join type**: Only `INNER JOIN` is currently supported
-//!    - LEFT, RIGHT, FULL, SEMI, and ANTI joins are planned for future work
+//! 2. **Join type**: `INNER`, `SEMI`, `ANTI`, `RIGHT SEMI`, and `RIGHT ANTI` joins are supported
+//!    - LEFT, RIGHT, and FULL joins are planned for future work
 //!
 //! 3. **LIMIT clause**: Query must have a LIMIT clause
 //!    - This ensures we only pay the cost of "late materialization" (random heap access)
@@ -323,13 +323,13 @@ impl CustomScan for JoinScan {
             let innerrel = args.innerrel;
             let extra = args.extra;
 
-            let (mut source_candidates, mut join_keys) =
+            let (mut source_candidates, mut join_keys, mut untranslated_quals) =
                 if let Some(res) = collect_join_sources(root, outerrel) {
                     res
                 } else {
                     return Vec::new();
                 };
-            let (inner_candidates, inner_keys) =
+            let (inner_candidates, inner_keys, inner_untranslated) =
                 if let Some(res) = collect_join_sources(root, innerrel) {
                     res
                 } else {
@@ -340,6 +340,7 @@ impl CustomScan for JoinScan {
 
             source_candidates.extend(inner_candidates);
             join_keys.extend(inner_keys);
+            untranslated_quals.extend(inner_untranslated);
 
             // Calculate estimates to decide which table to partition
             for source in &mut source_candidates {
@@ -384,16 +385,19 @@ impl CustomScan for JoinScan {
                 }
             }
 
-            let join_type: build::JoinType = jointype.into();
+            let join_type: build::JoinType = match jointype.try_into() {
+                Ok(jt) => jt,
+                Err(_) => {
+                    return Vec::new();
+                }
+            };
             if !join_type.supports_pushdown() {
                 let is_user_visible_jointype = jointype <= pg_sys::JoinType::JOIN_ANTI;
                 if is_interesting && is_user_visible_jointype {
                     Self::add_planner_warning(
-                            format!(
-                                "JoinScan not used: only INNER/SEMI/ANTI JOIN is currently supported, got {join_type}",
-                            ),
-                            &aliases,
-                        );
+                        format!("JoinScan not used: unsupported join type {join_type}",),
+                        &aliases,
+                    );
                 }
                 return Vec::new();
             }
@@ -440,15 +444,26 @@ impl CustomScan for JoinScan {
                 return Vec::new();
             }
 
+            // When there are untranslated quals (e.g. SubPlan from NOT IN),
+            // PostgreSQL evaluates them AFTER JoinScan returns each row.
+            // We must NOT push the LIMIT into DataFusion's plan because the
+            // filter may discard some rows, and we need DataFusion to keep
+            // producing rows until PostgreSQL's Limit node is satisfied.
+            let df_limit = if untranslated_quals.is_empty() {
+                limit
+            } else {
+                None
+            };
             let mut join_clause = JoinCSClause::new()
                 .with_join_type(join_type)
-                .with_limit(limit);
+                .with_limit(df_limit);
             join_clause.sources = sources;
 
             // The current parallel strategy partitions exactly one source and replicates all
-            // others. For SEMI/ANTI JOIN correctness, the partitioned source must be the left
-            // side. We currently enforce a conservative subset: binary base-table joins only.
-            if join_type.requires_left_partitioning() {
+            // others. For SEMI/ANTI/RIGHT_ANTI JOIN correctness, the partitioned source must
+            // be a specific side. We currently enforce a conservative subset: binary base-table
+            // joins only.
+            if let Some(required_idx) = join_type.required_partitioning_index() {
                 if outer_source_count != 1 || inner_source_count != 1 {
                     if is_interesting {
                         Self::add_planner_warning(
@@ -461,18 +476,10 @@ impl CustomScan for JoinScan {
                     return Vec::new();
                 }
 
-                let partitioning_idx = join_clause.partitioning_source_index();
-                if partitioning_idx != 0 {
-                    if is_interesting {
-                        Self::add_planner_warning(
-                            format!(
-                                "JoinScan not used: {join_type} JOIN requires the left side to be the largest source"
-                            ),
-                            &aliases,
-                        );
-                    }
-                    return Vec::new();
-                }
+                // For semi/anti joins, the partitioned side is dictated by
+                // join semantics (the "preserving" side), not by row count.
+                // Override the default largest-source heuristic.
+                join_clause.set_partitioning_source_index(required_idx);
             }
 
             // Validate ONLY the new keys added at this level (the recursive ones were validated during collection)
@@ -508,7 +515,9 @@ impl CustomScan for JoinScan {
                             return Vec::new();
                         }
                     }
-                    _ => return Vec::new(), // Should not happen if extraction logic is correct
+                    _ => {
+                        return Vec::new();
+                    }
                 }
             }
 
@@ -682,16 +691,23 @@ impl CustomScan for JoinScan {
 
             // TODO: Fix #4063 and mark this `set_parallel_safe(true)`.
 
-            let private_data = PrivateData::new(join_clause);
+            let mut private_data = PrivateData::new(join_clause);
+            private_data.num_heap_condition_clauses = multi_table_predicate_clauses.len();
             let mut custom_path = builder.build(private_data);
 
-            // Store the restrictlist and heap condition clauses in custom_private
-            // Structure: [PrivateData JSON, heap_cond_1, heap_cond_2, ...]
+            // Store the restrictlist, heap condition clauses, and untranslated
+            // quals in custom_private.
+            // Structure: [PrivateData JSON, heap_cond_1..N, untranslated_1..M]
+            // The count N is stored in PrivateData.num_heap_condition_clauses so
+            // plan_custom_path can split them: heap conds → custom_exprs,
+            // untranslated quals → plan.qual.
             let mut private_list = PgList::<pg_sys::Node>::from_pg(custom_path.custom_private);
 
-            // Add heap condition clauses as subsequent elements
             for clause in multi_table_predicate_clauses {
                 private_list.push(clause.cast());
+            }
+            for qual in untranslated_quals {
+                private_list.push(qual);
             }
             custom_path.custom_private = private_list.into_pg();
 
@@ -777,17 +793,33 @@ impl CustomScan for JoinScan {
                     .collect(),
             );
 
-            // Add heap condition clauses to custom_exprs so they get transformed by set_customscan_references.
-            // The Vars in these expressions will be converted to INDEX_VAR references into custom_scan_tlist.
+            // Split the extra nodes in custom_private into two groups:
+            //   1. Heap condition clauses (indices 1..1+N) → custom_exprs
+            //      These are multi-table predicates pushed to DataFusion.
+            //   2. Untranslated quals (indices 1+N..) → plan.qual
+            //      These are base-relation quals (e.g. SubPlan from NOT IN) that
+            //      couldn't be translated. PostgreSQL evaluates them on each row.
             let path_private_full = PgList::<pg_sys::Node>::from_pg((*best_path).custom_private);
+            let num_heap_conds = private_data.num_heap_condition_clauses;
             let mut custom_exprs_list = PgList::<pg_sys::Node>::from_pg(node.custom_exprs);
-            // Skip index 0 (PrivateData)
+            let mut qual_list = PgList::<pg_sys::Node>::new();
+
+            // Skip index 0 (PrivateData JSON)
             for i in 1..path_private_full.len() {
                 if let Some(node_ptr) = path_private_full.get_ptr(i) {
-                    custom_exprs_list.push(node_ptr);
+                    if i <= num_heap_conds {
+                        // Heap condition → custom_exprs (DataFusion filter)
+                        custom_exprs_list.push(node_ptr);
+                    } else {
+                        // Untranslated qual → plan.qual (PostgreSQL recheck)
+                        qual_list.push(node_ptr);
+                    }
                 }
             }
             node.custom_exprs = custom_exprs_list.into_pg();
+            if !qual_list.is_empty() {
+                node.scan.plan.qual = qual_list.into_pg();
+            }
 
             // Collect all required fields for execution
             collect_required_fields(
@@ -815,10 +847,11 @@ impl CustomScan for JoinScan {
                 .expect("Failed to serialize DataFusion logical plan"),
             );
 
-            // Convert PrivateData back to a list and preserve the restrictlist
+            // Convert PrivateData back to a list, preserving only heap condition
+            // clauses (untranslated quals are already in plan.qual).
             let mut new_private = PgList::<pg_sys::Node>::from_pg(PrivateData::into(private_data));
             let path_private_full = PgList::<pg_sys::Node>::from_pg((*best_path).custom_private);
-            for i in 1..path_private_full.len() {
+            for i in 1..=num_heap_conds {
                 if let Some(node_ptr) = path_private_full.get_ptr(i) {
                     new_private.push(node_ptr);
                 }
@@ -1111,7 +1144,16 @@ impl CustomScan for JoinScan {
                         state.custom_state_mut().current_batch = Some(batch);
                         state.custom_state_mut().batch_index = 0;
                     }
-                    Some(Err(e)) => panic!("DataFusion execution failed: {}", e),
+                    Some(Err(e)) => {
+                        // Drop the DataFusion stream and plan before raising
+                        // the error. This prevents double-free crashes during
+                        // PostgreSQL's memory context cleanup, since the error
+                        // will longjmp past Rust destructors on the stack.
+                        state.custom_state_mut().datafusion_stream = None;
+                        state.custom_state_mut().physical_plan = None;
+                        state.custom_state_mut().runtime = None;
+                        panic!("DataFusion execution failed: {}", e);
+                    }
                     None => return std::ptr::null_mut(),
                 }
             }
@@ -1121,6 +1163,15 @@ impl CustomScan for JoinScan {
     fn shutdown_custom_scan(_state: &mut CustomScanStateWrapper<Self>) {}
 
     fn end_custom_scan(state: &mut CustomScanStateWrapper<Self>) {
+        // Explicitly tear down DataFusion resources in the correct order
+        // (stream before plan before runtime) while we are still in a clean
+        // execution context.  This ensures they are gone before the
+        // JoinScanState Drop runs during memory-context cleanup, where
+        // dropping them would be unsafe (see Drop impl below).
+        state.custom_state_mut().datafusion_stream = None;
+        state.custom_state_mut().physical_plan = None;
+        state.custom_state_mut().runtime = None;
+
         unsafe {
             // Drop tuple slots that we own.
             for rel_state in state.custom_state().relations.values() {

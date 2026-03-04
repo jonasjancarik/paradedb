@@ -89,7 +89,9 @@ pub(super) unsafe fn expr_uses_scores_from_source(
 use crate::postgres::customscan::basescan::projections::score::is_score_func;
 use crate::postgres::customscan::builders::custom_path::OrderByStyle;
 use crate::postgres::customscan::opexpr::lookup_operator;
-use crate::postgres::customscan::qual_inspect::{extract_quals, PlannerContext, QualExtractState};
+use crate::postgres::customscan::qual_inspect::{
+    extract_quals, PlannerContext, Qual, QualExtractState,
+};
 use crate::postgres::customscan::range_table::{bms_iter, get_plain_relation_relid};
 use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::rel_get_bm25_index;
@@ -174,10 +176,21 @@ pub(super) unsafe fn get_type_info(type_oid: pg_sys::Oid) -> (i16, bool) {
 
 /// Try to collect all base join sources and join keys from a RelOptInfo.
 /// Returns a list of all base relations and all accumulated join keys involved in the join tree.
+/// Collect join sources from a `RelOptInfo`.
+///
+/// Returns `(sources, join_keys, untranslated_quals)` where `untranslated_quals`
+/// are base-relation `RestrictInfo` clause expressions that could not be pushed
+/// down into the BM25 index (e.g. SubPlan nodes from `NOT IN`). These must be
+/// preserved as PostgreSQL-level quals (`plan.qual`) on the CustomScan node so
+/// that PostgreSQL evaluates them on each output row.
 pub(super) unsafe fn collect_join_sources(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
-) -> Option<(Vec<JoinSourceCandidate>, Vec<JoinKeyPair>)> {
+) -> Option<(
+    Vec<JoinSourceCandidate>,
+    Vec<JoinKeyPair>,
+    Vec<*mut pg_sys::Node>,
+)> {
     if rel.is_null() {
         return None;
     }
@@ -202,6 +215,7 @@ pub(super) unsafe fn collect_join_sources(
         let relid = get_plain_relation_relid(rte)?;
 
         let mut side_info = JoinSourceCandidate::new(rti).with_heaprelid(relid);
+        let mut untranslated_quals: Vec<*mut pg_sys::Node> = Vec::new();
 
         if !(*rte).eref.is_null() {
             let eref = (*rte).eref;
@@ -233,31 +247,63 @@ pub(super) unsafe fn collect_join_sources(
             //
             // Note: Cross-table predicates (e.g., involving multiple tables in a join)
             // are handled separately via SearchPredicateUDF through filter pushdown.
+            //
+            // We try each RestrictInfo individually rather than passing the whole
+            // list, because unrecognized nodes (e.g. SubPlan from NOT IN) would
+            // cause extract_quals to return None for the entire list.
             let baserestrictinfo = PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo);
             if !baserestrictinfo.is_empty() {
                 let context = PlannerContext::from_planner(root);
-                let mut state = QualExtractState::default();
+                let mut combined_quals = Vec::new();
+                let mut combined_state = QualExtractState::default();
 
-                if let Some(qual) = extract_quals(
-                    &context,
-                    rti,
-                    baserestrictinfo.as_ptr().cast(),
-                    anyelement_query_input_opoid(),
-                    crate::postgres::customscan::builders::custom_path::RestrictInfoType::BaseRelation,
-                    &bm25_index,
-                    false,
-                    &mut state,
-                    true,
-                ) {
-                    if state.uses_our_operator {
-                        let query = SearchQueryInput::from(&qual);
-                        side_info = side_info.with_query(query);
+                for ri in baserestrictinfo.iter_ptr() {
+                    if ri.is_null() {
+                        continue;
                     }
+                    let mut state = QualExtractState::default();
+                    if let Some(qual) = extract_quals(
+                        &context,
+                        rti,
+                        ri.cast(),
+                        anyelement_query_input_opoid(),
+                        crate::postgres::customscan::builders::custom_path::RestrictInfoType::BaseRelation,
+                        &bm25_index,
+                        false,
+                        &mut state,
+                        true,
+                    ) {
+                        combined_quals.push(qual);
+                        if state.uses_our_operator {
+                            combined_state.uses_our_operator = true;
+                        }
+                        if state.uses_tantivy_to_query {
+                            combined_state.uses_tantivy_to_query = true;
+                        }
+                        if state.uses_heap_expr {
+                            combined_state.uses_heap_expr = true;
+                        }
+                    } else {
+                        // This RestrictInfo could not be translated (e.g. SubPlan
+                        // from NOT IN). Preserve its clause so PostgreSQL can
+                        // evaluate it as a recheck on each output row.
+                        untranslated_quals.push((*ri).clause as *mut pg_sys::Node);
+                    }
+                }
+
+                if combined_state.uses_our_operator && !combined_quals.is_empty() {
+                    let qual = if combined_quals.len() == 1 {
+                        combined_quals.pop().unwrap()
+                    } else {
+                        Qual::And(combined_quals)
+                    };
+                    let query = SearchQueryInput::from(&qual);
+                    side_info = side_info.with_query(query);
                 }
             }
         }
 
-        return Some((vec![side_info], Vec::new()));
+        return Some((vec![side_info], Vec::new(), untranslated_quals));
     }
 
     // Case 2: Join Relation (multiple relids)
@@ -280,6 +326,8 @@ pub(super) unsafe fn collect_join_sources(
                 if !private_list.is_empty() {
                     let private_data = PrivateData::from((*custom_path).custom_private);
                     // Return all sources and keys from the existing JoinScan
+                    // Note: untranslated quals from sub-joins were already stored
+                    // in the sub-join's custom_private; they'll be handled there.
                     return Some((
                         private_data
                             .join_clause
@@ -288,6 +336,7 @@ pub(super) unsafe fn collect_join_sources(
                             .map(JoinSourceCandidate::from)
                             .collect(),
                         private_data.join_clause.join_keys,
+                        Vec::new(),
                     ));
                 }
             }
@@ -302,17 +351,22 @@ pub(super) unsafe fn collect_join_sources(
             let outer_rel = (*outer_path).parent;
             let inner_rel = (*inner_path).parent;
 
-            let (mut sources, mut keys) = collect_join_sources(root, outer_rel)?;
-            let (inner_sources, inner_keys) = collect_join_sources(root, inner_rel)?;
+            let (mut sources, mut keys, mut untranslated) = collect_join_sources(root, outer_rel)?;
+            let (inner_sources, inner_keys, inner_untranslated) =
+                collect_join_sources(root, inner_rel)?;
             sources.extend(inner_sources);
             keys.extend(inner_keys);
+            untranslated.extend(inner_untranslated);
 
             // Extract keys for this level
             let join_restrict_info = (*join_path).joinrestrictinfo;
             let join_conditions = extract_join_conditions_from_list(join_restrict_info, &sources);
 
             // Only support pushdown-capable join types for reconstruction
-            let join_type: super::build::JoinType = (*join_path).jointype.into();
+            let join_type: super::build::JoinType = match (*join_path).jointype.try_into() {
+                Ok(jt) => jt,
+                Err(_) => return None,
+            };
             if !join_type.supports_pushdown() {
                 return None;
             }
@@ -361,7 +415,7 @@ pub(super) unsafe fn collect_join_sources(
 
             keys.extend(join_conditions.equi_keys);
 
-            return Some((sources, keys));
+            return Some((sources, keys, untranslated));
         }
     }
 
@@ -571,14 +625,7 @@ unsafe fn ensure_field(side: &mut JoinSource, attno: pg_sys::AttrNumber) {
 
     if let Some(field) = resolve_fast_field(attno as i32, &tupdesc, &indexrel) {
         side.scan_info.add_field(attno, field);
-        return;
     }
-
-    pgrx::warning!(
-        "ensure_field: failed for attno {} in relation {:?}",
-        attno,
-        side.scan_info.alias.clone()
-    );
 }
 
 unsafe fn get_attno_by_name(side: &JoinSource, name: &str) -> Option<pg_sys::AttrNumber> {
@@ -851,6 +898,7 @@ pub(super) unsafe fn extract_orderby(
                 let varno = (*var).varno as pg_sys::Index;
                 let varattno = (*var).varattno;
 
+                let mut var_found = false;
                 for source in sources {
                     if source.contains_rti(varno) {
                         // Try to find a display name (optional)
@@ -866,8 +914,13 @@ pub(super) unsafe fn extract_orderby(
                             },
                             direction,
                         });
+                        var_found = true;
                         break;
                     }
+                }
+                // Only need one member from the equivalence class
+                if var_found {
+                    break;
                 }
             }
         }

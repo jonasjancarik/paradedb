@@ -136,6 +136,47 @@ impl JoinScanState {
     }
 }
 
+impl Drop for JoinScanState {
+    fn drop(&mut self) {
+        // If the DataFusion stream, plan, or runtime are still alive when
+        // JoinScanState is dropped, we are in an abnormal cleanup path
+        // (e.g. PostgreSQL is running proc_exit after a FATAL error, or a
+        // parallel worker is being terminated).
+        //
+        // In this scenario the Drop may be running from within the same call
+        // stack that was actively polling the stream (e.g. Scanner::next →
+        // ProcessInterrupts → errfinish(FATAL) → proc_exit →
+        // MemoryContextDelete → this Drop).  The async generator inside the
+        // stream holds Rust values (Vec buffers, Arc references) whose
+        // pointers are only valid while the generator frame is live.
+        // Dropping the stream here would run the generator's destructor,
+        // which tries to free those buffers — but they may already be in an
+        // inconsistent state, causing a double-free crash.
+        //
+        // The safe path (end_custom_scan, or the error handler in
+        // exec_custom_scan) sets these fields to None *before* we reach this
+        // Drop.  If they're still Some here, we intentionally leak them to
+        // avoid the crash — the process is about to exit anyway.
+        if self.datafusion_stream.is_some()
+            || self.physical_plan.is_some()
+            || self.runtime.is_some()
+        {
+            if let Some(stream) = self.datafusion_stream.take() {
+                std::mem::forget(stream);
+            }
+            if let Some(batch) = self.current_batch.take() {
+                std::mem::forget(batch);
+            }
+            if let Some(plan) = self.physical_plan.take() {
+                std::mem::forget(plan);
+            }
+            if let Some(runtime) = self.runtime.take() {
+                std::mem::forget(runtime);
+            }
+        }
+    }
+}
+
 impl CustomScanState for JoinScanState {
     fn init_exec_method(&mut self, _cstate: *mut pg_sys::CustomScanState) {
         // No special initialization needed for the plain exec method
@@ -328,7 +369,11 @@ fn build_clause_df<'a>(
                 // If not connected, it's a cross join.
 
                 // TODO: review this
-                if join_clause.join_type.requires_left_partitioning() {
+                if join_clause
+                    .join_type
+                    .required_partitioning_index()
+                    .is_some()
+                {
                     return Err(DataFusionError::Internal(format!(
                         "JoinScan runtime: {} JOIN requires equi-join keys",
                         join_clause.join_type

@@ -18,41 +18,38 @@
 use datafusion::common::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryPool, MemoryReservation};
 
-/// A memory pool that panics when the memory limit is exceeded.
+/// A memory pool that returns errors when the memory limit is exceeded.
 ///
 /// This is used to enforce `work_mem` limits in `JoinScan` and prevent
 /// DataFusion from attempting to spill to disk (which is not yet implemented safely).
 ///
-/// TODO: Instead of panicking, implement a `MemoryPool` that integrates with PostgreSQL's
+/// Important: this pool must NOT panic on OOM. A panic during async DataFusion
+/// execution partially unwinds futures, leaving the execution plan tree in an
+/// inconsistent state. When PostgreSQL later drops `JoinScanState` during memory
+/// context cleanup, the Drop of the partially-freed plan triggers a double-free
+/// crash. Instead, `try_grow` returns `ResourcesExhausted`, which DataFusion
+/// propagates cleanly through the stream as `Some(Err(...))`.
+///
+/// TODO: Instead of erroring, implement a `MemoryPool` that integrates with PostgreSQL's
 /// temporary file management (BufFile/VFD) to allow DataFusion to spill to disk when
 /// `work_mem` is exceeded.
 #[derive(Debug)]
 pub struct PanicOnOOMMemoryPool {
     pool: datafusion::execution::memory_pool::GreedyMemoryPool,
-    limit: usize,
 }
 
 impl PanicOnOOMMemoryPool {
     pub fn new(limit: usize) -> Self {
         Self {
             pool: datafusion::execution::memory_pool::GreedyMemoryPool::new(limit),
-            limit,
-        }
-    }
-
-    fn check_limit(&self, additional: usize) {
-        if self.pool.reserved() + additional > self.limit {
-            panic!(
-                "JoinScan: Out of memory! Query exceeded work_mem limit of {} bytes.",
-                self.limit
-            );
         }
     }
 }
 
 impl MemoryPool for PanicOnOOMMemoryPool {
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.check_limit(additional);
+        // grow() is for unconditional bookkeeping (e.g. after try_grow succeeded).
+        // Don't check limits here — GreedyMemoryPool::grow() doesn't either.
         self.pool.grow(reservation, additional);
     }
 
@@ -65,11 +62,8 @@ impl MemoryPool for PanicOnOOMMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), DataFusionError> {
-        self.check_limit(additional);
-        // Delegate to inner pool, though we've already done our own check.
-        // The inner pool also enforces the limit but returns Error.
-        // We want to panic if WE detect it, so we did check_limit above.
-        // But for correctness of inner state, we call it.
+        // Delegate to the inner GreedyMemoryPool which checks the limit and
+        // returns Err(ResourcesExhausted) when exceeded.
         self.pool.try_grow(reservation, additional)
     }
 
